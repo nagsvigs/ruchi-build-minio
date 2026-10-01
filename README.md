@@ -1,29 +1,157 @@
 # Ruchi — Telugu voice cooking assistant
 
-A real-time, hands-free **Telugu** cooking companion. Speak naturally;
-Ruchi guides you step by step, sets timers, and remembers you.
+A real-time, hands-free **Telugu** cooking companion. Tap the orb, speak
+naturally; Ruchi guides you step by step, sets timers, and remembers you
+across sessions.
+
+## What it does
+
+- Listens to your Telugu speech and transcribes it in real time
+- Holds a cooking conversation (intake → steps → timers → fixes)
+- Speaks every reply aloud in Telugu with expressive delivery
+- Loads recipes from a 200-dish South-Indian dataset (or the web)
+- Remembers your preferences, restrictions, and history (Postgres)
+- Lets you interrupt mid-sentence — it stops and answers the new question
+
+## Architecture
+
+Four layers. Each layer degrades gracefully to the next one down.
 
 ```text
-Browser (demo/) ──mic PCM──▶ /api/voice/stream (Sarvam realtime STT)
-        ▲──played audio ◀── /api/voice/tts (ElevenLabs streaming)
-        │                    /api/voice-agent/... (Gemini function-calling
-        │                     tools: recipe, steps, timers, memory tools)
-        │                              │
-        │                    ┌─────────▼──────────┐
-        │                    │ Postgres + pgvector │  sessions, turns,
-        │                    │ (local Docker)      │  long-term memories,
-        │                    └─────────────────────┘  200-recipe catalog
+┌─ Layer 1 · Browser client (demo/) ──────────────────────────┐
+│ Single page: orb UI, mic capture (16 kHz PCM), audio play,  │
+│ state panel, tool chips, logs. Sends audio over WebSocket,   │
+│ text over HTTP. Barge-in: talking over Ruchi stops her and   │
+│ answers your new question.                                   │
+└──────────────┬─────────────────────────────┬────────────────┘
+               │  WS /api/voice/stream       │  HTTP /api/voice/*,
+               │                             │  /api/voice-agent/*, /api/recipes
+┌──────────────▼─────────────────────────────▼────────────────┐
+│ Layer 2 · Voice I/O (FastAPI: app.py, server_voice.py)      │
+│  STT:  Sarvam realtime → Vosk (offline) → browser           │
+│  TTS:  ElevenLabs (streamed PCM) → edge-tts → browser       │
+│  Session audio is also recorded to recordings/<id>.mp3      │
+└──────────────┬──────────────────────────────────────────────┘
+               │ text in, text out (+ tool calls)
+┌──────────────▼──────────────────────────────────────────────┐
+│ Layer 3 · Agent (runner.py → dispatcher → *_tools.py)       │
+│  Gemini function-calling loop picks tools; Python handlers  │
+│  execute them deterministically (recipe steps, timers, …).  │
+│  Mock runner takes over with zero config (no Gemini key).   │
+│  recipe_catalog + recipe_engine: the 200-recipe dataset,     │
+│  exact quantities, Telugu heat phrases, English utensils,    │
+│  parallel steps. online_recipe.py fetches unknown dishes.   │
+│  Prompts (prompts/): the Ruchi brain — Telugu-only, stages, │
+│  situations, safety, emotion tags.                          │
+└──────────────┬──────────────────────────────────────────────┘
+               │ sessions, turns, memories, recipes
+┌──────────────▼──────────────────────────────────────────────┐
+│ Layer 4 · Persistence (Postgres + pgvector, local Docker)   │
+│  sessions · conversations · memories (vector search) ·       │
+│  recipes. Embeddings run locally (fastembed, no API key).   │
+│  No DB → the assistant still works, just without memory.    │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-## Quickstart
+### A single voice turn, end to end
+
+1. You speak → mic PCM streams to `/api/voice/stream`.
+2. **Sarvam** transcribes live; its VAD decides when your turn ends →
+   `transcript.final`.
+3. Browser POSTs the text to `/api/voice-agent/sessions/{id}/turn`.
+4. Server fetches your recent turns + relevant long-term **memories**
+   (local embedding + pgvector, ~30 ms) and builds the prompt:
+   *system prompt + recipe truth + memories*.
+5. **Gemini** replies, optionally calling tools (`load_recipe`,
+   `set_servings`, `next_step`, `start_timer`, …).
+6. The turn + tool results are saved (Postgres + Markdown log); memory
+   extraction runs in the background.
+7. Browser POSTs the reply to `/api/voice/tts`; **ElevenLabs** streams
+   Telugu audio that starts playing in ~1 s.
+
+## Required API keys
+
+| Key(s) | Used for | Where to get it | Without it |
+|---|---|---|---|
+| `GOOGLE_API_KEY` | Gemini LLM (conversation + tools) and background memory extraction | https://aistudio.google.com | Mock runner (limited canned replies) |
+| `ELEVEN_API_KEY` + `ELEVEN_VOICE_ID` | Expressive Telugu TTS | https://elevenlabs.io | edge-tts (free, no key), then browser voice |
+| `SARVAM_API_KEY` | Telugu speech-to-text (realtime + batch) | https://sarvam.ai | Vosk offline model, then browser STT |
+
+All keys go in `.env` (copy `.env.example`). Everything else —
+Vosk, edge-tts, Postgres, embeddings — runs locally and free.
+
+## Setup from scratch
+
+### 1. Prerequisites
+
+- **Python 3.10+** (`python3 --version`)
+- **Docker** (only for the memory database) — `docker --version`
+- **Firefox or Chrome**, with a working microphone
+- Open `http://127.0.0.1:8000/demo/` (localhost is required for mic access)
+
+### 2. Clone and create the Python environment
 
 ```bash
-./run.sh                       # server on 127.0.0.1:8000 → http://127.0.0.1:8000/demo/
-docker compose -f infra/docker-compose.yaml up -d postgres   # memory database
+git clone https://github.com/nagsvigs/ruchi-build-v1.git
+cd ruchi-build-v1
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-Copy `.env.example` to `.env` and fill in API keys. Then hard-refresh the
-demo in Firefox (`Ctrl+Shift+R`), tap the orb, and speak.
+### 3. Configure
+
+```bash
+cp .env.example .env
+# edit .env and paste your API keys (see table above)
+```
+
+### 4. Download the Vosk Telugu model (one time, ~50 MB)
+
+```bash
+mkdir -p models && cd models
+curl -L -o vosk-te.zip https://alphacephei.com/vosk/models/vosk-model-small-te-0.42.zip
+unzip vosk-te.zip && rm vosk-te.zip && cd ..
+```
+
+Skip this if you only want browser speech recognition (set nothing — the
+server falls back automatically).
+
+### 5. Start the memory database (one time)
+
+```bash
+docker compose -f infra/docker-compose.yaml up -d postgres
+```
+
+The server creates the tables itself on first boot, syncs the 200 recipes,
+and downloads the small local embedding model (~220 MB) once. Set
+`MEMORY_ENABLED=0` in `.env` to skip all of this.
+
+### 6. Run the server
+
+```bash
+./run.sh                       # http://127.0.0.1:8000
+PORT=8001 ./run.sh             # custom port
+```
+
+Useful URLs: demo → `/demo/`, API docs → `/docs`, health → `/api/health`.
+
+### 7. Use it
+
+1. Open `http://127.0.0.1:8000/demo/` (hard-refresh once: `Ctrl+Shift+R`).
+2. Allow the microphone **once** (tick "remember this decision").
+3. Tap the **orb** — Ruchi greets you in Telugu.
+4. Speak, e.g. *"నాకు ఇడ్లీ చేయాలి"*. Interrupt her anytime; she stops
+   and answers the new question.
+
+## Running & testing
+
+```bash
+./run.sh                                   # start the server
+.venv/bin/python -m pytest tests/ -q      # test suite
+curl http://127.0.0.1:8000/api/health     # health check
+docker compose -f infra/docker-compose.yaml ps postgres   # DB status
+```
 
 ## Repository layout
 
@@ -39,7 +167,7 @@ demo in Firefox (`Ctrl+Shift+R`), tap the orb, and speak.
 │   ├── runner.py              Gemini function-calling loop + latency controls
 │   ├── dispatcher.py          tool name → Python handler
 │   ├── state.py               VoiceSession / RecipeContext
-│   ├── cooking_tools.py       13 cook tools (recipe, steps, timers, …)
+│   ├── cooking_tools.py       15 cook tools (recipe, steps, timers, …)
 │   ├── intake_tools.py        recipe-recording interview tools
 │   ├── tool_schemas.py        Gemini functionDeclarations
 │   ├── mock_runner.py         offline fallback when no Gemini key
@@ -58,7 +186,7 @@ demo in Firefox (`Ctrl+Shift+R`), tap the orb, and speak.
 ├── data/                      runtime data (see data/README.md)
 │   └── recipes.json           the 200-recipe South-Indian dataset (tracked)
 ├── models/                    Vosk Telugu STT model (downloaded, git-ignored)
-├── infra/                     local infra (Postgres+pgvector LiveKit stack)
+├── infra/                     local infra (Postgres+pgvector, LiveKit stack)
 ├── docs/                      design notes (ARCHITECTURE.md/.pdf, explained.md)
 ├── transcripts/               human-readable conversation logs (runtime)
 └── recordings/                per-session audio (runtime)
