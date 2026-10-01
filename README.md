@@ -121,6 +121,18 @@ curl http://127.0.0.1:8000/api/health     # health check
 docker compose -f infra/docker-compose.yaml ps postgres   # DB status
 ```
 
+## Session recordings → MinIO
+
+Every session's mic + TTS audio is mixed into `recordings/<id>.mp3` and
+**mirrored to MinIO** automatically (bucket `recordings`, public-read):
+
+- `GET /api/voice-agent/sessions/{id}/recording` → downloads the MP3 and
+  returns its MinIO link in the `X-Minio-URL` header.
+- `GET /api/voice-agent/recordings` → lists recordings with `minio_url`.
+
+Config in `.env` (`MINIO_ENABLED=1`, `MINIO_ENDPOINT`, `MINIO_ACCESS_KEY`,
+`MINIO_BUCKET`). MinIO console: `http://127.0.0.1:9001`.
+
 ## Repository layout
 
 ```text

@@ -41,6 +41,32 @@ DEFAULT_DIR = _HERE.parent / "recordings"
 # Serializes segment writes and ffmpeg runs.
 _LOCK = threading.Lock()
 
+# Tracks which MP3 mtimes have already been mirrored, so repeat
+# finalize()/download hits don't re-upload unchanged files.
+_UPLOADED_MTIME: dict[str, float] = {}
+
+
+def _mirror_to_minio(out: "Path") -> None:
+    """Mirror ``out`` to MinIO (background) unless already uploaded."""
+    try:
+        mtime = out.stat().st_mtime
+    except OSError:
+        return
+    key = str(out)
+    if _UPLOADED_MTIME.get(key) == mtime:
+        return
+
+    def _run() -> None:
+        try:
+            from . import minio_store
+
+            if minio_store.upload_file(out) is not None:
+                _UPLOADED_MTIME[key] = mtime
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=_run, name="minio-mirror", daemon=True).start()
+
 # Audio container per stream kind.
 _EXT_BY_KIND = {"user": "webm", "ruchi": "mp3"}
 
@@ -137,6 +163,7 @@ def finalize(session_id: str) -> Path | None:
         if out.exists():
             newest = max(p.stat().st_mtime for p in segs)
             if out.stat().st_mtime >= newest:
+                _mirror_to_minio(out)
                 return out
 
         shutil.rmtree(work, ignore_errors=True)
@@ -181,22 +208,30 @@ def finalize(session_id: str) -> Path | None:
             return None
 
     log.info("recording: wrote %s (%d bytes)", out.name, out.stat().st_size)
+    _mirror_to_minio(out)
     return out
 
 
 def list_recordings() -> list[dict]:
     d = recordings_dir()
+    try:
+        from . import minio_store
+
+        use_minio = minio_store.enabled()
+    except Exception:  # noqa: BLE001
+        use_minio = False
     items = []
     for p in sorted(d.glob("*.mp3"), key=lambda x: x.stat().st_mtime, reverse=True):
         st = p.stat()
-        items.append(
-            {
-                "session_id": p.stem,
-                "file": p.name,
-                "bytes": st.st_size,
-                "modified": int(st.st_mtime),
-            }
-        )
+        item = {
+            "session_id": p.stem,
+            "file": p.name,
+            "bytes": st.st_size,
+            "modified": int(st.st_mtime),
+        }
+        if use_minio:
+            item["minio_url"] = minio_store.public_url(p.name)
+        items.append(item)
     return items
 
 

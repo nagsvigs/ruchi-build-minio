@@ -30,6 +30,9 @@ onnxruntime>=1.18,<2
 tokenizers>=0.20,<1
 huggingface-hub>=0.20,<2
 
+# ---- MinIO object storage (session recordings) ----
+boto3>=1.28,<2
+
 # ---- Tests ----
 pytest>=8,<10
 pytest-asyncio>=0.23,<2

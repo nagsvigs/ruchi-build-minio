@@ -468,7 +468,15 @@ async def get_session_recording(session_id: str):
             status_code=404,
             detail="no recording for this session yet",
         )
-    return FileResponse(path, media_type="audio/mpeg", filename=path.name)
+    headers = {}
+    try:
+        from . import minio_store
+
+        if minio_store.enabled():
+            headers["X-Minio-URL"] = minio_store.public_url(path.name)
+    except Exception:  # noqa: BLE001
+        pass
+    return FileResponse(path, media_type="audio/mpeg", filename=path.name, headers=headers or None)
 
 
 @router.get("/recordings")
