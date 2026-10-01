@@ -16,41 +16,9 @@ across sessions.
 ## Architecture
 
 Four layers. Each layer degrades gracefully to the next one down.
+<img width="1774" height="887" alt="image" src="https://github.com/user-attachments/assets/e9eda983-d916-47f7-842f-db0ffc9713e7" />
 
-```text
-┌─ Layer 1 · Browser client (demo/) ──────────────────────────┐
-│ Single page: orb UI, mic capture (16 kHz PCM), audio play,  │
-│ state panel, tool chips, logs. Sends audio over WebSocket,   │
-│ text over HTTP. Barge-in: talking over Ruchi stops her and   │
-│ answers your new question.                                   │
-└──────────────┬─────────────────────────────┬────────────────┘
-               │  WS /api/voice/stream       │  HTTP /api/voice/*,
-               │                             │  /api/voice-agent/*, /api/recipes
-┌──────────────▼─────────────────────────────▼────────────────┐
-│ Layer 2 · Voice I/O (FastAPI: app.py, server_voice.py)      │
-│  STT:  Sarvam realtime → Vosk (offline) → browser           │
-│  TTS:  ElevenLabs (streamed PCM) → edge-tts → browser       │
-│  Session audio is also recorded to recordings/<id>.mp3      │
-└──────────────┬──────────────────────────────────────────────┘
-               │ text in, text out (+ tool calls)
-┌──────────────▼──────────────────────────────────────────────┐
-│ Layer 3 · Agent (runner.py → dispatcher → *_tools.py)       │
-│  Gemini function-calling loop picks tools; Python handlers  │
-│  execute them deterministically (recipe steps, timers, …).  │
-│  Mock runner takes over with zero config (no Gemini key).   │
-│  recipe_catalog + recipe_engine: the 200-recipe dataset,     │
-│  exact quantities, Telugu heat phrases, English utensils,    │
-│  parallel steps. online_recipe.py fetches unknown dishes.   │
-│  Prompts (prompts/): the Ruchi brain — Telugu-only, stages, │
-│  situations, safety, emotion tags.                          │
-└──────────────┬──────────────────────────────────────────────┘
-               │ sessions, turns, memories, recipes
-┌──────────────▼──────────────────────────────────────────────┐
-│ Layer 4 · Persistence (Postgres + pgvector, local Docker)   │
-│  sessions · conversations · memories (vector search) ·       │
-│  recipes. Embeddings run locally (fastembed, no API key).   │
-│  No DB → the assistant still works, just without memory.    │
-└─────────────────────────────────────────────────────────────┘
+
 ```
 
 ### A single voice turn, end to end
@@ -92,7 +60,7 @@ Vosk, edge-tts, Postgres, embeddings — runs locally and free.
 ### 2. Clone and create the Python environment
 
 ```bash
-git clone https://github.com/nagsvigs/ruchi-build-v1.git
+git clone https://github.com/aegion-dynamic/ruchi-build-v1.git
 cd ruchi-build-v1
 python3 -m venv .venv
 source .venv/bin/activate
@@ -208,8 +176,4 @@ docker compose -f infra/docker-compose.yaml ps postgres   # DB status
   retrieved by semantic similarity on every turn. No DB → still works,
   just without memory.
 
-## Docs
 
-- `docs/ARCHITECTURE.md` (and `.pdf`) — design notes.
-- `docs/explained.md` — component explainer.
-- `voice_agent_functions/README.md` — the original function-tool spec.
