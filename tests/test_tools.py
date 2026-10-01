@@ -2,7 +2,7 @@
 
 Run with::
 
-    cd backend && python -m pytest voice_agent_functions/tests
+    python -m pytest tests
 
 The tests don't hit the network — they exercise the dispatcher +
 session state directly so the whole tool surface can be validated
@@ -20,6 +20,7 @@ from voice_agent_functions.cooking_tools import (
     cancel_timer,
     finish_cooking,
     goto_step,
+    mark_parallel_complete,
     next_step,
     pause,
     previous_step,
@@ -321,7 +322,8 @@ class TestSchemas:
         from voice_agent_functions.tool_schemas import COOKING_TOOL_SCHEMAS
         names = {t["name"] for t in COOKING_TOOL_SCHEMAS}
         assert names == {
-            "next_step", "previous_step", "goto_step",
+            "load_recipe", "fetch_recipe_online", "set_servings", "suggest_recipes",
+            "next_step", "previous_step", "goto_step", "mark_parallel_complete",
             "start_timer", "cancel_timer",
             "pause", "resume",
             "report_issue", "resolve_issue",
@@ -457,3 +459,89 @@ class TestTranscript:
         transcript.log_turn(session_id="s1", mode="cook",
                             user_text="hi", assistant_text="hello")
         assert transcript.read_transcript() == ""
+
+
+# ============================================================
+# Session audio recording (mic + Ruchi TTS -> MP3)
+# ============================================================
+class TestRecording:
+    @pytest.fixture(autouse=True)
+    def _tmp_dir(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("RECORDINGS_DIR", str(tmp_path))
+        monkeypatch.setenv("RECORDING_ENABLED", "1")
+        yield
+
+    @staticmethod
+    def _tone(path, codec="libopus"):
+        import subprocess
+        subprocess.run(
+            ["ffmpeg", "-y", "-v", "error", "-f", "lavfi",
+             "-i", "sine=frequency=440:duration=0.5", "-c:a", codec, path],
+            check=True,
+        )
+
+    def test_add_segment_keeps_chronological_order(self):
+        from voice_agent_functions import recording
+        assert recording.add_segment("s1", "user", b"abc") is not None
+        assert recording.add_segment("s1", "ruchi", b"def") is not None
+        names = sorted(p.name for p in recording.segments_dir("s1").iterdir())
+        assert [n.split("_", 1)[1] for n in names] == ["user.webm", "ruchi.mp3"]
+
+    def test_finalize_mixes_to_mp3(self, tmp_path):
+        import shutil
+        if not shutil.which("ffmpeg"):
+            pytest.skip("ffmpeg not installed")
+        from voice_agent_functions import recording
+        u = tmp_path / "u.webm"
+        self._tone(str(u), codec="libopus")
+        r = tmp_path / "r.mp3"
+        self._tone(str(r), codec="libmp3lame")
+        recording.add_segment("s2", "user", u.read_bytes())
+        recording.add_segment("s2", "ruchi", r.read_bytes())
+        out = recording.finalize("s2")
+        assert out is not None and out.exists()
+        assert out.stat().st_size > 0
+        assert out.name == "s2.mp3"
+
+    def test_disabled_skips_writes(self, monkeypatch):
+        from voice_agent_functions import recording
+        monkeypatch.setenv("RECORDING_ENABLED", "0")
+        assert recording.add_segment("s3", "user", b"abc") is None
+        assert recording.finalize("s3") is None
+
+
+# ============================================================
+# Parallel / completed-step tracking
+# ============================================================
+class TestCompletedSteps:
+    def test_next_step_skips_completed_parallel_step(self, cooking_session):
+        # Mark step 2 (index 1) done early, then advance from step 1.
+        mark_parallel_complete(cooking_session, 2)
+        assert cooking_session.recipe.is_completed(1)
+        event = next_step(cooking_session)
+        assert event["type"] == "step_changed"
+        # step 1 (index 0) done, step 2 already done → lands on index 2
+        assert event["stepIndex"] == 2
+
+    def test_mark_parallel_complete_validates(self, cooking_session):
+        with pytest.raises(ValueError):
+            mark_parallel_complete(cooking_session, 99)
+
+    def test_next_step_marks_current_completed(self, cooking_session):
+        next_step(cooking_session)
+        assert cooking_session.recipe.is_completed(0)
+
+    def test_mark_parallel_complete_event(self, cooking_session):
+        ev = mark_parallel_complete(cooking_session, 3)
+        assert ev["type"] == "step_completed"
+        assert ev["stepIndex"] == 2
+        assert ev["parallel"] is True
+
+
+class TestDispatcherParallel:
+    def test_mark_parallel_complete_dispatchable(self, cooking_session):
+        result = dispatch(cooking_session, "mark_parallel_complete", {"step": 2})
+        assert "error" not in result
+        assert cooking_session.recipe.is_completed(1)
+
+

@@ -17,15 +17,20 @@ from typing import Any, Callable
 
 from .cooking_tools import (
     cancel_timer,
+    fetch_recipe_online,
     finish_cooking,
     goto_step,
+    load_recipe,
+    mark_parallel_complete,
     next_step,
     pause,
     previous_step,
     report_issue,
     resolve_issue,
     resume,
+    set_servings,
     start_timer,
+    suggest_recipes,
 )
 from .intake_tools import finish_interview, save_answer
 from .state import VoiceSession
@@ -36,10 +41,16 @@ _HANDLERS: dict[str, Callable[..., dict[str, Any]]] = {
     # intake
     "save_answer": lambda s, **kw: save_answer(s, field=kw["field"], value=kw["value"]),
     "finish_interview": lambda s, **_: finish_interview(s),
+    # cook — recipe catalog
+    "load_recipe": lambda s, **kw: load_recipe(s, name=kw["name"]),
+    "fetch_recipe_online": lambda s, **kw: fetch_recipe_online(s, name=kw["name"]),
+    "set_servings": lambda s, **kw: set_servings(s, servings=kw["servings"]),
+    "suggest_recipes": lambda s, **kw: suggest_recipes(s, description=kw["description"]),
     # cooking — step nav
     "next_step": lambda s, **_: next_step(s),
     "previous_step": lambda s, **_: previous_step(s),
     "goto_step": lambda s, **kw: goto_step(s, step=kw["step"]),
+    "mark_parallel_complete": lambda s, **kw: mark_parallel_complete(s, step=kw["step"]),
     # cooking — timers
     "start_timer": lambda s, **kw: start_timer(s, seconds=kw["seconds"], label=kw["label"]),
     "cancel_timer": lambda s, **_: cancel_timer(s),
@@ -60,7 +71,8 @@ def known_tool_names(mode: str) -> set[str]:
         return {"save_answer", "finish_interview"}
     if mode == "cook":
         return {
-            "next_step", "previous_step", "goto_step",
+            "load_recipe", "fetch_recipe_online", "set_servings", "suggest_recipes",
+            "next_step", "previous_step", "goto_step", "mark_parallel_complete",
             "start_timer", "cancel_timer",
             "pause", "resume",
             "report_issue", "resolve_issue",

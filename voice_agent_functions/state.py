@@ -22,7 +22,10 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any, Literal, Optional
+from typing import TYPE_CHECKING, Any, Literal, Optional
+
+if TYPE_CHECKING:  # pragma: no cover
+    from .recipe_engine import Recipe, RecipeStep
 
 Mode = Literal["intake", "cook"]
 
@@ -58,19 +61,54 @@ class RecipeContext:
     recipe_name: str
     steps: list[str]
     step_index: int = 0
+    # Catalog id when the recipe came from the bundled dataset.
+    recipe_id: Optional[str] = None
+    # Structured "recipe truth" (heat, quantities, utensils, durations,
+    # parallel opportunities) built by recipe_engine.normalize_recipe.
+    structured: Optional["Recipe"] = None
+    # Step indices already done — including steps completed early as a
+    # parallel "meanwhile" task, so they are never repeated.
+    completed_steps: set[int] = field(default_factory=set)
+    # A future step the user is currently doing in parallel (if any).
+    parallel_step_index: Optional[int] = None
+    # Whether the parallel suggestion for the current step was already
+    # surfaced to the model (so it is offered only once).
+    parallel_announced: bool = False
 
     def step_text(self) -> str:
         if 0 <= self.step_index < len(self.steps):
             return self.steps[self.step_index]
         return ""
 
+    def structured_step(self, index: Optional[int] = None) -> Optional["RecipeStep"]:
+        if self.structured is None:
+            return None
+        return self.structured.step(self.step_index if index is None else index)
+
+    def is_completed(self, index: int) -> bool:
+        return index in self.completed_steps
+
+    def mark_completed(self, index: int) -> None:
+        if 0 <= index < len(self.steps):
+            self.completed_steps.add(index)
+
+    def next_open_index(self, start: int) -> Optional[int]:
+        """First index >= ``start`` not already completed, or ``None``."""
+        for i in range(max(0, start), len(self.steps)):
+            if i not in self.completed_steps:
+                return i
+        return None
+
     @classmethod
     def from_metadata(cls, data: dict[str, Any]) -> "RecipeContext":
+        from .recipe_engine import normalize_recipe
+
         steps = list(data.get("steps") or [])
         return cls(
             recipe_name=str(data.get("recipeName", "")),
             steps=steps,
             step_index=int(data.get("stepIndex", 0)),
+            structured=normalize_recipe(data),
         )
 
 
@@ -78,6 +116,7 @@ class RecipeContext:
 class VoiceSession:
     session_id: str
     mode: Mode
+    user_id: str = "default"
     answers: dict[str, str] = field(default_factory=dict)
     current_field: str = "name"
     recipe: Optional[RecipeContext] = None
@@ -85,6 +124,52 @@ class VoiceSession:
     active_timer: Optional[TimerState] = None
     active_issue: Optional[IssueState] = None
     events: list[dict[str, Any]] = field(default_factory=list)
+
+    # ------------------------------------------------------------------
+    # Persistence snapshot (Postgres)
+    # ------------------------------------------------------------------
+    def snapshot(self) -> dict[str, Any]:
+        """A compact, JSON-serializable state for the DB."""
+        recipe = None
+        if self.recipe is not None:
+            recipe = {
+                "recipeName": self.recipe.recipe_name,
+                "steps": list(self.recipe.steps),
+                "stepIndex": self.recipe.step_index,
+                "recipeId": self.recipe.recipe_id,
+                "completedSteps": sorted(self.recipe.completed_steps),
+                "parallelStepIndex": self.recipe.parallel_step_index,
+                "parallelAnnounced": self.recipe.parallel_announced,
+            }
+        return {
+            "answers": dict(self.answers),
+            "currentField": self.current_field,
+            "paused": self.paused,
+            "recipe": recipe,
+        }
+
+    @classmethod
+    def from_snapshot(
+        cls, session_id: str, mode: Mode, user_id: str, snap: dict[str, Any] | None
+    ) -> "VoiceSession":
+        snap = snap or {}
+        session = cls(session_id=session_id, mode=mode, user_id=user_id or "default")
+        session.answers = dict(snap.get("answers") or {})
+        session.current_field = snap.get("currentField") or "name"
+        session.paused = bool(snap.get("paused"))
+        recipe = snap.get("recipe")
+        if recipe and recipe.get("steps"):
+            ctx = RecipeContext(
+                recipe_name=recipe.get("recipeName", ""),
+                steps=list(recipe["steps"]),
+                step_index=int(recipe.get("stepIndex", 0)),
+                recipe_id=recipe.get("recipeId"),
+            )
+            ctx.completed_steps = set(recipe.get("completedSteps") or [])
+            ctx.parallel_step_index = recipe.get("parallelStepIndex")
+            ctx.parallel_announced = bool(recipe.get("parallelAnnounced"))
+            session.recipe = ctx
+        return session
 
     # ------------------------------------------------------------------
     # Intake helpers
@@ -120,6 +205,8 @@ class VoiceSession:
         assert self.recipe is not None, "recipe context not set"
         clamped = max(0, min(new_index, len(self.recipe.steps) - 1))
         self.recipe.step_index = clamped
+        self.recipe.parallel_step_index = None
+        self.recipe.parallel_announced = False
         return {
             "type": "step_changed",
             "stepIndex": clamped,

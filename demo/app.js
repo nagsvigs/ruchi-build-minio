@@ -4,130 +4,14 @@
    ============================================================ */
 
 const API_BASE =
-  (location.search.match(/api=([^&]+)/) || [, 'http://localhost:8000'])[1];
+  (location.search.match(/api=([^&]+)/) || [,
+    location.protocol.startsWith('http') ? location.origin : 'http://localhost:8000'
+  ])[1];
 
-// Recipe library. When the user names one of these dishes the recipe
-// panel swaps instantly and the session's recipe context is updated so
-// the step-navigation tools operate on the new steps.
-const RECIPES = {
-  biryani: {
-    recipeName: 'Paneer Biryani',
-    steps: [
-      'Soak the rice for 30 minutes.',
-      'Marinate the paneer in yogurt and spices.',
-      'Layer rice and paneer in a heavy pot.',
-      'Cook on low heat for 20 minutes.',
-    ],
-  },
-  dosa: {
-    recipeName: 'Masala Dosa',
-    steps: [
-      'Soak rice and urad dal for 4 hours.',
-      'Grind to a smooth batter.',
-      'Ferment the batter overnight.',
-      'Spread thinly on a hot tawa.',
-      'Add potato masala and fold.',
-    ],
-  },
-  poha: {
-    recipeName: 'Poha',
-    steps: [
-      'Rinse the poha and drain well.',
-      'Heat oil and splutter mustard seeds.',
-      'Add onions, curry leaves and turmeric.',
-      'Mix in the poha and cook 2 minutes.',
-      'Finish with lemon and coriander.',
-    ],
-  },
-  upma: {
-    recipeName: 'Upma',
-    steps: [
-      'Dry roast the rava until fragrant.',
-      'Splutter mustard, add onions and green chilli.',
-      'Add water, salt and bring to a boil.',
-      'Stir in the rava and cook until thick.',
-      'Garnish with coriander and serve.',
-    ],
-  },
-  'paneer butter masala': {
-    recipeName: 'Paneer Butter Masala',
-    steps: [
-      'Soak cashews and blend to a paste.',
-      'Sauté onions, tomato and spices.',
-      'Blend into a smooth gravy.',
-      'Add butter, cream and cashew paste.',
-      'Fold in paneer cubes and simmer.',
-    ],
-  },
-  dal: {
-    recipeName: 'Dal Tadka',
-    steps: [
-      'Wash and pressure cook the dal.',
-      'Prepare the tadka with ghee and cumin.',
-      'Add onions, tomato and turmeric.',
-      'Mix the tadka into the dal.',
-      'Finish with coriander and lemon.',
-    ],
-  },
-  pulao: {
-    recipeName: 'Vegetable Pulao',
-    steps: [
-      'Rinse and soak the rice 20 minutes.',
-      'Sauté whole spices and onions.',
-      'Add vegetables and cook 3 minutes.',
-      'Add rice and water, bring to a boil.',
-      'Cover and cook on low for 15 minutes.',
-    ],
-  },
-  pongal: {
-    recipeName: 'Ven Pongal',
-    steps: [
-      'Roast moong dal until golden.',
-      'Cook rice and dal together until soft.',
-      'Prepare a tadka of ghee, cumin and pepper.',
-      'Pour the tadka over the pongal.',
-      'Serve hot with sambar and chutney.',
-    ],
-  },
-};
-
-// Telugu / English dish-name → library key
-const DISH_ALIASES = {
-  'biryani': 'biryani', 'biriyani': 'biryani', 'బిర్యానీ': 'biryani',
-  'dosa': 'dosa', 'దోసె': 'dosa', 'దోశ': 'dosa',
-  'poha': 'poha', 'పోహా': 'poha', 'అటుకులు': 'poha',
-  'upma': 'upma', 'ఉప్మా': 'upma',
-  'paneer butter masala': 'paneer butter masala', 'paneer': 'paneer butter masala',
-  'dal': 'dal', 'dal tadka': 'dal', 'పప్పు': 'dal', 'పప్పు చారు': 'dal',
-  'pulao': 'pulao', 'pulav': 'pulao', 'పులావ్': 'pulao',
-  'pongal': 'pongal', 'పొంగల్': 'pongal',
-};
-
-/** Return a recipe object if the user's text names a known dish. */
-function detectDish(text) {
-  const t = (text || '').toLowerCase();
-  // longest alias first so "paneer butter masala" wins over "paneer"
-  const keys = Object.keys(DISH_ALIASES).sort((a, b) => b.length - a.length);
-  for (const alias of keys) {
-    if (t.includes(alias)) return RECIPES[DISH_ALIASES[alias]];
-  }
-  return null;
-}
-
-// Intent words that indicate the user wants to *start* a dish, not
-// comment on the one they're cooking.
-const DISH_INTENT = [
-  'want', 'make', 'cook', 'prepare', 'recipe', 'how to', 'how do i',
-  'show me', 'start', 'చేయాలి', 'వండాలి', 'రెసిపీ', 'చేద్దాం',
-  'వండుకుందాం', 'కావాలి', 'ఎలా చేయ', 'చెప్పు',
-];
-
-function isDishRequest(text) {
-  const t = (text || '').toLowerCase();
-  return DISH_INTENT.some((w) => t.includes(w));
-}
-
-let RECIPE = RECIPES.biryani;   // current recipe (mutable)
+// Recipes are no longer hardcoded here. Ruchi loads them from the
+// server-side catalog by voice (load_recipe tool). RECIPE is whatever
+// recipe the session currently has loaded, or null before that.
+let RECIPE = null;   // current recipe (loaded from the catalog)
 
 const INTAKE_FIELDS = [
   { name: 'name',        question: "What's the name of your recipe?" },
@@ -152,16 +36,32 @@ const state = {
   // MediaRecorder path
   recorder: null,
   recordStream: null,
+  micStream: null,     // acquired once, reused for every turn
+  // Realtime streaming STT (Vosk) + LiveKit semantic turn detection
+  streaming: false,
+  streamWs: null,
+  streamCtx: null,
+  streamNode: null,
+  streamSource: null,
+  streamRetries: 0,
+  speaking: false,     // true while Ruchi's TTS is playing
+  bargeIn: false,      // true when the user interrupted Ruchi
+  turnAbort: null,     // AbortController for the in-flight turn
+  pendingBargeText: null,  // new query to run after interrupting Ruchi
+  bargeWatchdog: null, // safety timer for a stuck turn
+  aiText: '',          // the assistant text currently being spoken
   recordChunks: [],
   recordStart: 0,
+  silenceTimer: null,
   analyser: null,
   audioCtx: null,
   orbState: 'idle',
   // Conversation mode (hands-free loop)
   conversationMode: false,
+  greeted: false,      // Ruchi speaks her greeting only once, on first orb tap
   paused: false,       // set by the `pause` tool / "stop" intent
   emptyTurns: 0,       // consecutive turns with no speech
-  finishRequested: false,
+  finishRequested: false,  // set by the finish_cooking tool
   // Event-driven state
   lastState: null,     // most recent session snapshot
   eventCount: 0,       // how many events we've already applied
@@ -169,6 +69,7 @@ const state = {
   timerHandle: null,
   timerEndsAt: null,
   timerLabel: null,
+  timerFired: false,   // guards against double-firing (client + server)
 };
 
 // ---------- DOM helpers --------------------------------------------------
@@ -232,7 +133,7 @@ function speakBrowser(text) {
   return new Promise((resolve) => {
     if (!text || !window.speechSynthesis) return resolve();
     window.speechSynthesis.cancel();
-    const u = new SpeechSynthesisUtterance(text);
+    const u = new SpeechSynthesisUtterance(stripTags(text));
     const v = pickTeluguVoice();
     if (v) u.voice = v;
     u.lang = v?.lang || 'te-IN';
@@ -244,20 +145,129 @@ function speakBrowser(text) {
   });
 }
 
-let _ttsAudio = null;
+let _ttsAudio = null;      // <audio> element (non-streamed playback)
+let _ttsCtx = null;        // AudioContext reused for PCM streaming
+let _ttsAbort = null;      // AbortController for the in-flight TTS stream
+let _ttsNodes = [];        // scheduled AudioBufferSourceNodes
+let _ttsGen = 0;           // bumped on every interrupt (barge-in / new reply)
+let _ttsAudioResolve = null; // resolves the <audio> playback promise on stop
+
+function _stopTts() {
+  _ttsGen++;  // makes an in-flight playPcmStream return early
+  try { if (_ttsAudio) { _ttsAudio.pause(); _ttsAudio = null; } } catch {}
+  // Resolve the pending <audio> promise so speak() never hangs after a pause.
+  try { if (_ttsAudioResolve) { const r = _ttsAudioResolve; _ttsAudioResolve = null; r(); } } catch {}
+  try { if (_ttsAbort) { _ttsAbort.abort(); _ttsAbort = null; } } catch {}
+  for (const n of _ttsNodes) { try { n.stop(); } catch {} }
+  _ttsNodes = [];
+}
+
+function _pcmStreamSupported() {
+  return typeof ReadableStream !== 'undefined' &&
+    !!(window.AudioContext || window.webkitAudioContext);
+}
+
+/** Play a streamed 16 kHz mono PCM response via the Web Audio API,
+ *  starting as soon as the first chunk arrives. Returns false if no
+ *  audio was produced (so the caller can fall back). */
+async function playPcmStream(resp, sampleRate = 16000) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return false;
+  if (!_ttsCtx || _ttsCtx.sampleRate !== sampleRate) {
+    try { _ttsCtx = new Ctx({ sampleRate }); }
+    catch { _ttsCtx = new Ctx(); }
+  }
+  const ctx = _ttsCtx;
+  if (ctx.state === 'suspended') { try { await ctx.resume(); } catch {} }
+
+  const gen = _ttsGen;
+  const reader = resp.body.getReader();
+  let leftover = new Uint8Array(0);
+  let nextStart = ctx.currentTime;
+  let got = 0;
+  while (true) {
+    if (_ttsGen !== gen) return true;  // interrupted by barge-in
+    const { done, value } = await reader.read();
+    if (done) break;
+    let bytes = value;
+    if (leftover.length) {
+      const merged = new Uint8Array(leftover.length + bytes.length);
+      merged.set(leftover, 0); merged.set(bytes, leftover.length);
+      bytes = merged; leftover = new Uint8Array(0);
+    }
+    if (bytes.length % 2) { leftover = bytes.slice(bytes.length - 1); bytes = bytes.slice(0, -1); }
+    if (!bytes.length) continue;
+    // .slice() gives a fresh buffer at offset 0 so Int16Array is aligned.
+    const i16 = new Int16Array(bytes.slice().buffer);
+    const f32 = new Float32Array(i16.length);
+    for (let i = 0; i < i16.length; i++) f32[i] = i16[i] / 32768;
+    const buf = ctx.createBuffer(1, f32.length, sampleRate);
+    buf.getChannelData(0).set(f32);
+    const src = ctx.createBufferSource();
+    src.buffer = buf; src.connect(ctx.destination);
+    const startAt = Math.max(ctx.currentTime + 0.03, nextStart);
+    src.start(startAt);
+    nextStart = startAt + buf.duration;
+    _ttsNodes.push(src);
+    got += i16.length;
+  }
+  if (!got) return false;
+  // Wait until the scheduled audio has played, but bail out early on barge-in.
+  // A wall-clock cap prevents an infinite wait if the AudioContext is
+  // suspended (autoplay policy) and its clock never advances.
+  const deadline = performance.now() + (nextStart - ctx.currentTime) * 1000 + 3000;
+  while (nextStart - ctx.currentTime > 0.03) {
+    if (_ttsGen !== gen) return true;
+    if (performance.now() > deadline) break;
+    await wait(40);
+  }
+  return true;
+}
+
 /** Speak `text`. Resolves when playback finishes (or immediately on failure). */
 async function speak(text, { interrupt = true } = {}) {
   if (!text) return;
   setOrb('speaking', 'speaking…');
+  if (interrupt) _stopTts();
+  // Keep the mic live while Ruchi speaks so the user can barge in (echo
+  // cancellation suppresses her own voice; the echo filter catches leaks).
+  state.speaking = true;
+  state.aiText = text;
+  try {
+    // 1) Prefer server-side TTS (ElevenLabs → edge-tts, chosen server-side)
+    if (state.caps?.elevenlabs || state.caps?.edge_tts) {
+      // 1a) Streaming PCM (ElevenLabs only) — lowest latency.
+      if (state.caps?.elevenlabs && _pcmStreamSupported()) {
+        try {
+          const ac = new AbortController();
+          _ttsAbort = ac;
+          const r = await fetch(`${API_BASE}/api/voice/tts`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ text, session_id: state.sessionId, stream: true }),
+            signal: ac.signal,
+          });
+          const ct = r.headers.get('content-type') || '';
+          if (ct.includes('audio/pcm')) {
+            const rate = parseInt(r.headers.get('X-Sample-Rate') || '16000', 10) || 16000;
+          const played = await playPcmStream(r, rate);
+          _ttsAbort = null;
+          if (played) return;
+        }
+        _ttsAbort = null;
+      } catch (e) {
+        _ttsAbort = null;
+        if (e.name === 'AbortError') return;  // barge-in/interrupt — stop here
+        log('error', 'streaming TTS failed', String(e).slice(0, 120));
+      }
+    }
 
-  // 1) Prefer server-side TTS (ElevenLabs → edge-tts, chosen server-side)
-  if (state.caps?.elevenlabs || state.caps?.edge_tts) {
+    // 1b) Non-streaming server TTS (whole file, then play).
     try {
-      if (interrupt && _ttsAudio) { _ttsAudio.pause(); _ttsAudio = null; }
       const r = await fetch(`${API_BASE}/api/voice/tts`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ text, session_id: state.sessionId }),
       });
       const ct = r.headers.get('content-type') || '';
       if (ct.includes('audio')) {
@@ -266,9 +276,15 @@ async function speak(text, { interrupt = true } = {}) {
         const audio = new Audio(url);
         _ttsAudio = audio;
         await new Promise((resolve) => {
-          audio.onended = () => { URL.revokeObjectURL(url); resolve(); };
-          audio.onerror = () => { URL.revokeObjectURL(url); resolve(); };
-          audio.play().catch(() => resolve());
+          const done = () => {
+            _ttsAudioResolve = null;
+            try { URL.revokeObjectURL(url); } catch {}
+            resolve();
+          };
+          _ttsAudioResolve = done;   // lets _stopTts resolve on barge-in
+          audio.onended = done;
+          audio.onerror = done;
+          audio.play().catch(done);
         });
         return;
       }
@@ -276,10 +292,14 @@ async function speak(text, { interrupt = true } = {}) {
     } catch (e) {
       log('error', 'server TTS failed', String(e).slice(0, 120));
     }
-  }
+    }
 
-  // 2) Browser fallback
-  await speakBrowser(text);
+    // 2) Browser fallback
+    await speakBrowser(text);
+  } finally {
+    state.speaking = false;
+    state.aiText = '';
+  }
 }
 
 // ---------- Speech recognition ----------------------------------------
@@ -290,6 +310,12 @@ async function speak(text, { interrupt = true } = {}) {
 
 async function startListening() {
   if (state.listening) return;
+  // Preferred: realtime streaming STT with server-side turn detection.
+  const serverStt = state.caps?.sarvam;
+  log('system', 'STT', `sarvam=${!!state.caps?.sarvam} → ${serverStt ? 'streaming' : 'fallback'}`);
+  if (serverStt && window.WebSocket && (window.AudioContext || window.webkitAudioContext)) {
+    return startStreaming();
+  }
   if (state.caps?.vosk && state.caps?.vosk_model && state.caps?.ffmpeg) {
     return startServerListening();
   }
@@ -297,18 +323,258 @@ async function startListening() {
 }
 
 // ---- server path (MediaRecorder + Vosk) ----
+// Acquire the microphone ONCE and reuse the same live stream for every
+// turn. Calling getUserMedia() again on each recording is what makes
+// some browsers re-prompt for permission; one persistent stream avoids it.
+async function getMicStream() {
+  const existing = state.micStream;
+  if (existing && existing.getAudioTracks().some((t) => t.readyState === 'live')) {
+    return existing;
+  }
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: {
+      echoCancellation: true,
+      noiseSuppression: true,
+      autoGainControl: true,
+    },
+  });
+  state.micStream = stream;
+  // If the browser/OS ends the track (device change, revoke), drop the
+  // cache so the next turn re-acquires cleanly.
+  stream.getAudioTracks().forEach((t) => {
+    t.addEventListener('ended', () => {
+      if (state.micStream === stream) state.micStream = null;
+    });
+  });
+  return stream;
+}
+
+// ---- realtime streaming path (Sarvam WebSocket, server-side turn detection) ----
+function _wsUrl() {
+  const base = API_BASE.replace(/^http/, 'ws');
+  const q = state.sessionId ? `?session_id=${encodeURIComponent(state.sessionId)}` : '';
+  return `${base}/api/voice/stream${q}`;
+}
+
+async function startStreaming() {
+  if (state.streaming) return;
+  let mic;
+  try {
+    mic = await getMicStream();
+  } catch (e) {
+    log('error', 'microphone blocked', 'Allow mic access for this site, then retry.');
+    pushBubble('system', '⚠ Microphone blocked. Click the mic icon in the address bar and allow access, then try again.');
+    endConversation();
+    return;
+  }
+
+  let ws;
+  try { ws = new WebSocket(_wsUrl()); }
+  catch (e) { return startServerListening(); }
+
+  state.streamWs = ws;
+  state.streaming = true;
+  state.listening = true;
+  _setMicEnabled(true);   // ensure the mic is live at the start
+  setOrb('listening', 'వింటున్నాను… (realtime)');
+  updateMicUi();
+  updateVoicePill();
+
+  ws.binaryType = 'arraybuffer';
+  ws.onopen = () => {
+    state.streamRetries = 0;
+    log('system', 'STT', 'realtime stream open');
+    try {
+      _startPcmCapture(mic);
+      const n = mic.getAudioTracks().length;
+      log('system', 'STT', `pcm capture started (${n} track${n === 1 ? '' : 's'}, ctx=${state.streamCtx?.state})`);
+    } catch (e) { log('error', 'pcm capture failed', String(e)); }
+  };
+  ws.onmessage = (ev) => _onStreamEvent(ev);
+  ws.onerror = () => log('error', 'stt stream error', 'reconnecting if it closes');
+  ws.onclose = () => {
+    const wasStreaming = state.streaming;
+    stopStreaming();
+    if (!(wasStreaming && state.conversationMode && !state.paused)) return;
+    // Reconnect the realtime stream rather than falling back to the
+    // ungated MediaRecorder path (which would record Ruchi's own voice).
+    state.streamRetries = (state.streamRetries || 0) + 1;
+    if (state.streamRetries <= 6) {
+      pushBubble('system', `Realtime STT dropped — reconnecting (${state.streamRetries})…`);
+      setTimeout(() => {
+        if (state.conversationMode && !state.paused) startStreaming();
+      }, 600);
+    } else {
+      pushBubble('system', 'Realtime STT unavailable — using fallback.');
+      startServerListening();
+    }
+  };
+}
+
+function _setMicEnabled(on) {
+  try {
+    (state.micStream?.getAudioTracks() || []).forEach((t) => { t.enabled = on; });
+  } catch {}
+}
+
+/** Create/resume the AudioContexts during a user gesture.
+ *  Browsers start AudioContexts suspended when created outside a gesture,
+ *  which silently stops the mic capture. Call this from click handlers. */
+function _unlockAudio() {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) return;
+  try {
+    if (!state.streamCtx || state.streamCtx.state === 'closed') {
+      state.streamCtx = new Ctx({ sampleRate: 16000 });
+    }
+    if (state.streamCtx.state === 'suspended') state.streamCtx.resume();
+  } catch {}
+  try {
+    if (!_ttsCtx || _ttsCtx.state === 'closed') _ttsCtx = new Ctx();
+    if (_ttsCtx.state === 'suspended') _ttsCtx.resume();
+  } catch {}
+}
+
+function _startPcmCapture(mic) {
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  // Reuse one AudioContext across sessions — creating/closing one per orb
+  // press eventually hits the browser's AudioContext limit.
+  if (!state.streamCtx || state.streamCtx.state === 'closed') {
+    state.streamCtx = new Ctx({ sampleRate: 16000 });
+  }
+  const ctx = state.streamCtx;
+  if (ctx.state === 'suspended') { try { ctx.resume(); } catch {} }
+  // Drop any previous capture nodes (e.g. after a reconnect).
+  try { if (state.streamNode) state.streamNode.disconnect(); } catch {}
+  try { if (state.streamSource) state.streamSource.disconnect(); } catch {}
+  const source = ctx.createMediaStreamSource(mic);
+  const node = ctx.createScriptProcessor(2048, 1, 1);
+  const inRate = ctx.sampleRate || 16000;
+  const ratio = inRate / 16000;
+  log('system', 'STT', `audio ctx rate=${inRate}Hz${inRate !== 16000 ? ' (resampling to 16k)' : ''}`);
+  node.onaudioprocess = (e) => {
+    const ws = state.streamWs;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    // Keep the mic live even while Ruchi speaks, so the user can barge in
+    // (echo cancellation suppresses Ruchi's own voice).
+    const f32 = e.inputBuffer.getChannelData(0);
+    // Sarvam needs 16 kHz mono. Browsers may ignore the AudioContext
+    // sampleRate hint, so resample linearly when needed.
+    let samples = f32;
+    if (ratio !== 1) {
+      const outLen = Math.floor(f32.length / ratio);
+      samples = new Float32Array(outLen);
+      for (let i = 0; i < outLen; i++) {
+        const idx = i * ratio;
+        const i0 = Math.floor(idx);
+        const i1 = Math.min(i0 + 1, f32.length - 1);
+        const frac = idx - i0;
+        samples[i] = f32[i0] * (1 - frac) + f32[i1] * frac;
+      }
+    }
+    const i16 = new Int16Array(samples.length);
+    for (let i = 0; i < samples.length; i++) {
+      const s = Math.max(-1, Math.min(1, samples[i]));
+      i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    }
+    ws.send(i16.buffer);
+  };
+  // ScriptProcessor only runs when connected to the destination; route it
+  // through a zero-gain node so the mic isn't played back (no feedback).
+  const mute = ctx.createGain();
+  mute.gain.value = 0;
+  source.connect(node);
+  node.connect(mute);
+  mute.connect(ctx.destination);
+  state.streamSource = source;
+  state.streamNode = node;
+}
+
+/** True when `partial` is mostly the words Ruchi is currently speaking
+ *  (i.e. speaker echo picked up by the mic), not a new user query. */
+function _looksLikeEcho(partial, aiText) {
+  const a = (aiText || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!a.length) return false;
+  const set = new Set(a);
+  const p = (partial || '').toLowerCase().split(/\s+/).filter(Boolean);
+  if (!p.length) return false;
+  const common = p.filter((w) => set.has(w)).length;
+  return common / p.length > 0.6;
+}
+
+function _onStreamEvent(ev) {
+  let msg;
+  try { msg = JSON.parse(ev.data); } catch { return; }
+  const type = msg.event || msg.type;
+  if (type === 'vad.speech_start') {
+    setOrb('listening', 'వింటున్నాను…');
+  } else if (type === 'transcript.partial') {
+    const t = (msg.text || '').trim();
+    if (t) {
+      setOrb('listening', t.slice(-48));
+      // Barge-in: the user is talking while Ruchi is speaking — stop her
+      // immediately and cancel the in-flight turn. Ignore text that matches
+      // Ruchi's own words (speaker echo) so she doesn't interrupt herself.
+      if (state.speaking && !_looksLikeEcho(t, state.aiText)) {
+        _stopTts();
+        state.bargeIn = true;
+        if (state.turnAbort) { try { state.turnAbort.abort(); } catch {} }
+      }
+    }
+  } else if (type === 'transcript.final') {
+    const text = (msg.text || '').trim();
+    if (!text || state.paused || state.finishRequested) return;
+    log('system', 'STT', `final (busy=${state.busy} speaking=${state.speaking}): ${text.slice(0, 40)}`);
+    // If the busy flag is stale (no in-flight turn, nothing speaking),
+    // clear it so the new query runs immediately.
+    if (state.busy && !state.speaking && !state.turnAbort) {
+      log('error', 'turn', 'clearing stale busy flag');
+      state.busy = false;
+    }
+    if (state.busy) {
+      // User interrupted Ruchi's answer — drop the old turn and run the
+      // new one as soon as the current turn unwinds.
+      state.pendingBargeText = text;
+      _stopTts();
+      if (state.turnAbort) { try { state.turnAbort.abort(); } catch {} }
+      // Safety net: if the in-flight turn is wedged, force it to unwind.
+      clearTimeout(state.bargeWatchdog);
+      state.bargeWatchdog = setTimeout(() => {
+        if (state.busy && state.pendingBargeText) {
+          log('error', 'turn', 'stuck turn — forcing reset');
+          state.busy = false;
+          state.speaking = false;
+          const t = state.pendingBargeText;
+          state.pendingBargeText = null;
+          sendMessage(t);
+        }
+      }, 6000);
+      return;
+    }
+    log('success', 'STT (realtime)', { transcript: text });
+    $('#input-text').value = text;
+    sendMessage(text);
+  } else if (type === 'error') {
+    log('error', 'stt stream', msg.message || 'error');
+  }
+}
+
+function stopStreaming() {
+  state.streaming = false;
+  state.listening = false;
+  try { if (state.streamNode) state.streamNode.disconnect(); } catch {}
+  try { if (state.streamSource) state.streamSource.disconnect(); } catch {}
+  // Keep state.streamCtx alive for the next session (reused, not closed).
+  state.streamNode = null; state.streamSource = null;
+  const ws = state.streamWs;
+  state.streamWs = null;
+  if (ws) { try { ws.onclose = null; ws.onmessage = null; ws.close(); } catch {} }
+}
+
 async function startServerListening() {
   let stream;
   try {
-    // echoCancellation stops Ruchi's own voice from being re-recorded,
-    // which is essential for hands-free back-and-forth.
-    stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        echoCancellation: true,
-        noiseSuppression: true,
-        autoGainControl: true,
-      },
-    });
+    stream = await getMicStream();
   } catch (e) {
     log('error', 'microphone blocked', 'Allow mic access for this site, then retry.');
     pushBubble('system', '⚠ Microphone blocked. Click the mic icon in the address bar and allow access, then try again.');
@@ -325,7 +591,9 @@ async function startServerListening() {
   state.recordStream = stream;
   state.recordChunks = chunks;
 
-  // Silence detection — auto-stop ~1.2s after speech ends.
+  // End-of-turn detection: adaptive noise floor + shorter trailing
+  // silence (700ms, was 1200ms) so Ruchi replies faster, plus a minimum
+  // speech duration so a cough/click doesn't end the turn.
   const ac = new (window.AudioContext || window.webkitAudioContext)();
   const src = ac.createMediaStreamSource(stream);
   const analyser = ac.createAnalyser();
@@ -335,25 +603,38 @@ async function startServerListening() {
   state.analyser = analyser;
   state.audioCtx = ac;
 
+  const TRAILING_SILENCE_MS = 700;
+  const MIN_SPEECH_MS = 250;
+  const MIN_THRESHOLD = 6;
   let spoke = false;
+  let speechStart = 0;
   let lastLoud = performance.now();
+  let noiseFloor = 2;  // running estimate of ambient peak
+  const clearSilenceTimer = () => {
+    if (state.silenceTimer) { clearInterval(state.silenceTimer); state.silenceTimer = null; }
+  };
   const tick = () => {
-    if (!state.listening) return;
+    if (!state.listening) { clearSilenceTimer(); return; }
     analyser.getByteTimeDomainData(data);
     let peak = 0;
     for (let i = 0; i < data.length; i++) peak = Math.max(peak, Math.abs(data[i] - 128));
-    const loud = peak > 8;
-    if (loud) {
-      if (!spoke) { state.emptyTurns = 0; }  // real speech detected
-      spoke = true;
-      lastLoud = performance.now();
-    }
     const now = performance.now();
-    if (spoke && now - lastLoud > 1200) { stopListening(); return; }
+    const threshold = Math.max(MIN_THRESHOLD, noiseFloor * 2.5);
+    const loud = peak > threshold;
+    if (loud) {
+      if (!spoke) { state.emptyTurns = 0; speechStart = now; }  // speech began
+      spoke = true;
+      lastLoud = now;
+    } else if (!spoke) {
+      // Adapt the noise floor only while the user isn't speaking.
+      noiseFloor = noiseFloor * 0.95 + peak * 0.05;
+    }
+    if (spoke && now - lastLoud > TRAILING_SILENCE_MS && now - speechStart > MIN_SPEECH_MS) {
+      stopListening(); return;
+    }
     // No speech at all: give more time in conversation mode.
     const idleLimit = state.conversationMode ? 10000 : 8000;
     if (!spoke && now - state.recordStart > idleLimit) { stopListening(); return; }
-    requestAnimationFrame(tick);
   };
 
   rec.ondataavailable = (ev) => { if (ev.data.size) chunks.push(ev.data); };
@@ -363,14 +644,18 @@ async function startServerListening() {
   setOrb('listening', state.conversationMode ? 'వింటున్నాను… (hands-free)' : 'వింటున్నాను… (speak, auto-stops)');
   updateMicUi();
   updateVoicePill();
-  requestAnimationFrame(tick);
+  // Use a timer (not requestAnimationFrame) so silence detection keeps
+  // running even when the tab is backgrounded / throttled.
+  clearSilenceTimer();
+  state.silenceTimer = setInterval(tick, 100);
 }
 
 async function transcribeAndSend() {
   const chunks = state.recordChunks || [];
   const blob = new Blob(chunks, { type: 'audio/webm' });
-  // cleanup
-  try { state.recordStream?.getTracks().forEach((t) => t.stop()); } catch {}
+  // cleanup — close the analyser but KEEP the mic stream alive so the
+  // browser doesn't re-prompt for permission on the next turn.
+  if (state.silenceTimer) { clearInterval(state.silenceTimer); state.silenceTimer = null; }
   try { state.audioCtx?.close(); } catch {}
   state.recorder = null; state.recordStream = null; state.audioCtx = null;
 
@@ -380,6 +665,7 @@ async function transcribeAndSend() {
   try {
     const fd = new FormData();
     fd.append('file', blob, 'voice.webm');
+    if (state.sessionId) fd.append('session_id', state.sessionId);
     const r = await fetch(`${API_BASE}/api/voice/stt`, { method: 'POST', body: fd });
     const j = await r.json();
     const text = (j.transcript || '').trim();
@@ -461,6 +747,7 @@ function startBrowserListening() {
 
 /** Stop capturing (to transcribe). Does NOT end the conversation. */
 function stopListening() {
+  if (state.silenceTimer) { clearInterval(state.silenceTimer); state.silenceTimer = null; }
   if (state.recorder && state.recorder.state !== 'inactive') {
     try { state.recorder.stop(); } catch {}
     state.listening = false;
@@ -477,8 +764,11 @@ function stopListening() {
 
 /** Called after a turn finishes. Restarts listening if in conversation mode. */
 async function afterTurn() {
+  // In realtime streaming mode the socket stays open and keeps listening;
+  // server-side VAD detects the next turn, so nothing to restart.
+  if (state.streaming) return;
   if (state.conversationMode && !state.paused) {
-    await wait(300);
+    await wait(120);
     if (state.conversationMode && !state.paused) {
       startListening();
       return;
@@ -488,6 +778,7 @@ async function afterTurn() {
 }
 
 function resetMicUi() {
+  if (state.silenceTimer) { clearInterval(state.silenceTimer); state.silenceTimer = null; }
   state.listening = false;
   setOrb('idle', state.conversationMode ? 'conversation ended' : 'tap to talk');
   updateMicUi();
@@ -515,14 +806,28 @@ async function startConversation() {
   state.conversationMode = true;
   state.paused = false;
   state.emptyTurns = 0;
+  _unlockAudio();   // must run inside the user gesture
   updateMicUi();
   pushBubble('system', '🎙 Conversation mode ON — speak freely. Ruchi will keep listening after each reply. Tap ⏹ to stop.');
+  // Ruchi stays silent until the user starts the conversation. On the
+  // first tap, speak the mandatory greeting, then listen.
+  if (!state.greeted) {
+    state.greeted = true;
+    const greeting = "హాయ్, నేను రుచి, మీ వంటింటి సఖిని. ఈ వేళ ఏం వండుదాం, చెప్పు";
+    pushBubble('ai', greeting);
+    await speak(greeting);
+  }
   await startListening();
 }
 
 function endConversation() {
   state.conversationMode = false;
   state.paused = false;
+  state.pendingBargeText = null;
+  state.bargeIn = false;
+  if (state.turnAbort) { try { state.turnAbort.abort(); } catch {} state.turnAbort = null; }
+  _stopTts();
+  stopStreaming();
   updateMicUi();
   resetMicUi();
 }
@@ -578,9 +883,22 @@ function updateVoicePill() {
 }
 
 // ---------- Session lifecycle -------------------------------------------
+/** Stable per-browser identity so Ruchi remembers this person. */
+function getUserId() {
+  try {
+    let id = localStorage.getItem('ruchi_user_id');
+    if (!id) {
+      id = 'u_' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+      localStorage.setItem('ruchi_user_id', id);
+    }
+    return id;
+  } catch {
+    return 'default';
+  }
+}
+
 async function createSession(mode) {
-  const body = { mode };
-  if (mode === 'cook') body.recipe = RECIPE;
+  const body = { mode, user_id: getUserId() };
   const r = await fetch(`${API_BASE}/api/voice-agent/sessions`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -592,7 +910,9 @@ async function createSession(mode) {
   state.eventCount = 0;
   state.lastState = j;
   $('#session-id').textContent = j.session_id.slice(0, 8) + '…';
-  $('#recipe-name').textContent = j.recipe?.recipeName || RECIPE.recipeName;
+  const rec = $('#recording-btn');
+  if (rec) rec.href = `${API_BASE}/api/voice-agent/sessions/${j.session_id}/recording`;
+  $('#recipe-name').textContent = j.recipe?.recipeName || 'No recipe yet';
   renderRecipeSteps(j.recipe);
   renderIntakeFields(j);
   refreshState(j);
@@ -626,14 +946,17 @@ async function setRecipe(recipe) {
 
 async function resetSession() {
   if (state.pollHandle) clearInterval(state.pollHandle);
+  stopStreaming();
   if (state.sessionId) {
     try { await fetch(`${API_BASE}/api/voice-agent/sessions/${state.sessionId}`, { method: 'DELETE' }); } catch {}
   }
   state.sessionId = null;
+  state.greeted = false;
   $('#transcript').innerHTML = '';
   $('#log').innerHTML = '';
   pushBubble('system', 'New session starting…');
   await createSession(state.mode);
+  if (state.conversationMode) startListening();
 }
 
 // ---------- State (event-driven, instant) ------------------------------
@@ -685,11 +1008,35 @@ function applyEvent(ev) {
       renderRecipeSteps(state.lastState.recipe);
       flashTile('#state-step');
       break;
+    case 'recipe_loaded':
+      state.lastState = state.lastState || {};
+      state.lastState.recipe = {
+        recipeName: ev.recipeName, steps: ev.steps, stepIndex: ev.stepIndex || 0,
+      };
+      RECIPE = { recipeName: ev.recipeName, steps: ev.steps };
+      $('#recipe-name').textContent = ev.recipeName;
+      renderRecipeSteps(state.lastState.recipe);
+      pushBubble('system', `📖 Loaded ${ev.recipeName} (${(ev.steps || []).length} steps).`);
+      flashTile('#state-step');
+      break;
+    case 'servings_set':
+      pushBubble('system', `👥 Scaled ingredients for ${ev.servings} ${ev.servings === 1 ? 'person' : 'people'}.`);
+      break;
+    case 'step_completed':
+      pushBubble('system', `✅ Step ${(ev.stepIndex ?? 0) + 1} already done (parallel).`);
+      break;
+    case 'recipe_suggestions': {
+      const names = (ev.candidates || []).map((c) => c.name).join(', ');
+      if (names) pushBubble('system', `💡 Suggestions: ${names}`);
+      break;
+    }
     case 'timer_started':
+      state.timerFired = false;
       startTimerCountdown(ev.seconds, ev.label);
       flashTile('#state-timer');
       break;
     case 'timer_cancelled':
+      state.timerFired = false;
       stopTimerCountdown();
       break;
     case 'timer_expired':
@@ -792,7 +1139,11 @@ function stopTimerCountdown() {
 
 function onTimerExpired(label) {
   stopTimerCountdown();
-  pushBubble('system', `⏰ Time's up — check ${label}.`);
+  // The client countdown and the server `timer_expired` event both land
+  // here — only act once.
+  if (state.timerFired) return;
+  state.timerFired = true;
+  pushBubble('system', `⏰ Time's up — check the food.`);
   const tile = $('#state-timer')?.closest('.state-tile');
   if (tile) {
     tile.classList.add('alert');
@@ -806,6 +1157,19 @@ function onTimerExpired(label) {
     o.frequency.value = 880; g.gain.value = 0.15;
     o.start(); o.stop(ac.currentTime + 0.5);
   } catch {}
+  // Automatically advance to the next step (Ruchi will speak it).
+  _advanceAfterTimer();
+}
+
+/** Ask Ruchi for the next step once the timer is done. Retries if a turn
+ *  is already in flight (e.g. she's still speaking). */
+async function _advanceAfterTimer(attempt = 0) {
+  if (state.paused || state.mode !== 'cook') return;
+  if (state.busy) {
+    if (attempt < 12) setTimeout(() => _advanceAfterTimer(attempt + 1), 700);
+    return;
+  }
+  sendMessage('టైమర్ అయిపోయింది. వంట సిద్ధమైందో చెక్ చేయమని చెప్పి, తర్వాత స్టెప్ చెప్పు.', { silent: true });
 }
 
 // Slow background poll as a safety net only (events give instant updates).
@@ -866,6 +1230,13 @@ function renderIntakeFields(j) {
 }
 
 // ---------- Conversation / log ------------------------------------------
+/** Remove ElevenLabs emotion tags (e.g. [warm]) for on-screen display.
+ *  The tags are still sent to TTS, which uses them for delivery. */
+function stripTags(text) {
+  return (text || '').replace(/\[\s*[A-Za-z]+(?:\s*,\s*[A-Za-z]+)*\s*\]/g, ' ')
+    .replace(/\s{2,}/g, ' ').trim();
+}
+
 function pushBubble(kind, text) {
   const t = $('#transcript');
   // Remove empty state if present
@@ -933,28 +1304,29 @@ function setOrb(stateName, label) {
 }
 
 // ---------- Message send ------------------------------------------------
-async function sendMessage(text) {
-  if (!text.trim() || state.busy) return;
-  state.busy = true;
-  $('#input-text').value = '';
-  pushBubble('user', text);
-  setOrb('thinking', 'thinking…');
-
-  // If the user is *requesting* a dish, swap the recipe panel + session
-  // instantly. We require an intent word so "the biryani is salty" doesn't
-  // switch recipes mid-cook.
-  if (state.mode === 'cook') {
-    const dish = detectDish(text);
-    if (dish && isDishRequest(text) && dish.recipeName !== RECIPE.recipeName) {
-      await setRecipe(dish);
-    }
+async function sendMessage(text, { silent = false } = {}) {
+  if (!text.trim()) return;
+  if (state.busy) {
+    // Barge-in while a turn is in flight — queue and cancel the old turn.
+    state.pendingBargeText = text;
+    _stopTts();
+    if (state.turnAbort) { try { state.turnAbort.abort(); } catch {} }
+    return;
   }
+  state.busy = true;
+  state.bargeIn = false;
+  state.turnAbort = new AbortController();
+  const signal = state.turnAbort.signal;
+  $('#input-text').value = '';
+  if (!silent) pushBubble('user', text);
+  setOrb('thinking', 'thinking…');
 
   try {
     const r = await fetch(`${API_BASE}/api/voice-agent/sessions/${state.sessionId}/turn`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ text }),
+      signal,
     });
     const j = await r.json();
 
@@ -975,31 +1347,52 @@ async function sendMessage(text) {
       if (tc.name === 'pause') state.paused = true;
       // `resume` clears the pause and lets the loop continue.
       if (tc.name === 'resume') state.paused = false;
-      // `finish_cooking` ends the session.
+      // `finish_cooking` ends the session once the dish is done.
       if (tc.name === 'finish_cooking') state.finishRequested = true;
     });
 
-    pushBubble('ai', j.assistant_text);
-    await speak(j.assistant_text);   // wait until Ruchi finishes speaking
-    refreshState(await getState());
+    if (j.error) {
+      pushBubble('system', `⚠ ${j.error}`);
+      log('error', 'turn failed', j.error);
+    }
+    if (j.assistant_text && !state.pendingBargeText) {
+      pushBubble('ai', j.assistant_text);
+      await speak(j.assistant_text);   // wait until Ruchi finishes speaking
+    }
+    refreshStateFromLocal();
   } catch (err) {
-    pushBubble('system', `⚠ ${err.message}`);
-    log('error', 'request failed', err.message);
+    if (err.name !== 'AbortError') {
+      pushBubble('system', `⚠ ${err.message}`);
+      log('error', 'request failed', err.message);
+    }
   } finally {
     state.busy = false;
-    // If the model asked to pause or finish, stop the loop.
+    state.turnAbort = null;
+    state.speaking = false;
+    state.aiText = '';
+    clearTimeout(state.bargeWatchdog);
+    state.bargeWatchdog = null;
+
+    // Barge-in: the user interrupted — answer their new query instead.
+    const pending = state.pendingBargeText;
+    state.pendingBargeText = null;
+    if (pending) {
+      state.bargeIn = false;
+      sendMessage(pending);
+      return;
+    }
+    // The model signalled the cooking is finished. Ruchi NEVER ends the
+    // conversation on her own — she asks for feedback and keeps talking.
     if (state.finishRequested) {
       state.finishRequested = false;
-      pushBubble('system', 'Cooking session finished.');
-      endConversation();
-      return;
+      pushBubble('system', '🍽 Cooking finished — Ruchi will keep chatting.');
     }
     if (state.paused) {
       pushBubble('system', 'Paused — tap the orb to resume the conversation.');
       endConversation();
       return;
     }
-    // Otherwise continue the hands-free loop.
+    // Otherwise keep the hands-free conversation going until cooking is done.
     await afterTurn();
   }
 }
@@ -1118,22 +1511,21 @@ async function switchMode(mode) {
   $('#mode-intake').classList.toggle('active', mode === 'intake');
   $('#mode-cook').classList.toggle('active', mode === 'cook');
   $('#group-intake').style.display = mode === 'intake' ? '' : 'none';
+  stopStreaming();
   if (state.sessionId) {
     try { await fetch(`${API_BASE}/api/voice-agent/sessions/${state.sessionId}`, { method: 'DELETE' }); } catch {}
   }
   state.sessionId = null;
   $('#transcript').innerHTML = '';
   await createSession(mode);
+  if (state.conversationMode) startListening();
   // Speak the first intake question
   if (mode === 'intake') {
     const q = INTAKE_FIELDS[0].question;
     pushBubble('ai', q);
     speak(q);
-  } else {
-    const greeting = "నమస్కారం! నేను రుచి. Let's cook " + RECIPE.recipeName + '. ' + RECIPE.steps[0];
-    pushBubble('ai', greeting);
-    speak(greeting);
   }
+  // Cook mode stays silent until the user taps the orb / mic button.
 }
 
 // ---------- UI wiring ----------------------------------------------------
@@ -1198,8 +1590,15 @@ function wireUi() {
 
 // ---------- Boot --------------------------------------------------------
 (async function boot() {
-  await loadVoices();
   await loadCaps();
+  // Only touch the browser SpeechSynthesis API when we actually need it.
+  // On Linux Firefox, calling speechSynthesis.getVoices() logs
+  // "Speech Dispatcher required for SpeechSynthesis API" when
+  // speech-dispatcher isn't installed. Skip it entirely when server-side
+  // TTS (ElevenLabs / edge-tts) is available.
+  if (!state.caps?.elevenlabs && !state.caps?.edge_tts) {
+    await loadVoices();
+  }
   wireUi();
   await ping();
   setInterval(ping, 5000);
@@ -1223,8 +1622,6 @@ function wireUi() {
     pushBubble('system', '⚠ No voice output available.');
   }
 
-  // Greet on first load (spoken via edge-tts if available).
-  const greeting = "నమస్కారం! నేను రుచి. Let's cook " + RECIPE.recipeName + '. Step 1: ' + RECIPE.steps[0];
-  pushBubble('ai', greeting);
-  speak(greeting);
+  // Ruchi stays silent until the user taps the orb / mic button.
+  pushBubble('system', 'Tap the 🎤 button or the orb to start talking with Ruchi.');
 })();

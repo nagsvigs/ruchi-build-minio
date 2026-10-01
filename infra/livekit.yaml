@@ -1,0 +1,26 @@
+# LiveKit server config — LOCAL DEV ONLY.
+# devkey/secret are the well-known LiveKit dev credentials.
+
+port: 7880
+bind_addresses:
+  - "0.0.0.0"
+
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50100
+  # Local machine only; no public IP discovery needed.
+  use_external_ip: false
+
+redis:
+  address: redis:6379
+
+keys:
+  devkey: secretsecretsecretsecretsecretsecret12
+
+room:
+  auto_create: true
+  empty_timeout: 300
+
+logging:
+  level: info

@@ -18,6 +18,7 @@ import io
 import json
 import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -37,6 +38,28 @@ VOSK_MODEL_DIR = _PROJECT_ROOT / "models" / "vosk-model-small-te-0.42"
 # Telugu neural voices from edge-tts.
 TELUGU_VOICES = ("te-IN-ShrutiNeural", "te-IN-MohanNeural")
 DEFAULT_TTS_VOICE = "te-IN-ShrutiNeural"
+
+# A single shared AsyncClient keeps connections (and TLS handshakes) warm
+# across turns — creating one per request added ~0.1-0.3s each call.
+_http: httpx.AsyncClient | None = None
+
+
+def _client() -> httpx.AsyncClient:
+    global _http
+    if _http is None:
+        _http = httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=10.0),
+            limits=httpx.Limits(max_keepalive_connections=8, max_connections=16),
+        )
+    return _http
+
+
+async def aclose() -> None:
+    """Close the shared client (called on app shutdown)."""
+    global _http
+    if _http is not None:
+        await _http.aclose()
+        _http = None
 
 
 # ============================================================
@@ -80,13 +103,146 @@ async def synthesize_elevenlabs(
         "model_id": model,
         "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
     }
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, json=payload)
+    r = await _client().post(url, headers=headers, json=payload)
+    if r.status_code >= 400:
+        raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:300]}")
+    if not r.content:
+        raise RuntimeError("ElevenLabs returned no audio")
+    return bytes(r.content)
+
+
+async def stream_elevenlabs(
+    text: str,
+    voice_id: Optional[str] = None,
+    model_id: Optional[str] = None,
+    output_format: str = "pcm_16000",
+):
+    """Yield raw PCM chunks from ElevenLabs' streaming endpoint.
+
+    Streaming lets the browser start playing after the first chunk
+    (~1s) instead of waiting for the whole clip (~3s). Yields
+    ``bytes`` chunks of signed 16-bit little-endian mono PCM at the
+    sample rate encoded in ``output_format`` (16000 by default).
+    """
+    key = os.getenv("ELEVEN_API_KEY") or os.getenv("ELEVENLABS_API_KEY")
+    vid = voice_id or os.getenv("ELEVEN_VOICE_ID")
+    model = model_id or os.getenv("ELEVEN_MODEL_ID", "eleven_v3_conversational")
+    if not key:
+        raise RuntimeError("ELEVEN_API_KEY is not set")
+    if not vid:
+        raise RuntimeError("ELEVEN_VOICE_ID is not set")
+    if not text.strip():
+        raise ValueError("text is empty")
+
+    url = (
+        f"https://api.elevenlabs.io/v1/text-to-speech/{vid}/stream"
+        f"?output_format={output_format}"
+    )
+    headers = {
+        "xi-api-key": key,
+        "Content-Type": "application/json",
+        "Accept": "audio/pcm",
+    }
+    payload = {
+        "text": text.strip()[:2000],
+        "model_id": model,
+        "voice_settings": {"stability": 0.5, "similarity_boost": 0.75},
+    }
+    async with _client().stream("POST", url, headers=headers, json=payload) as r:
         if r.status_code >= 400:
-            raise RuntimeError(f"ElevenLabs {r.status_code}: {r.text[:300]}")
-        if not r.content:
-            raise RuntimeError("ElevenLabs returned no audio")
-        return bytes(r.content)
+            body = (await r.aread()).decode(errors="replace")[:300]
+            raise RuntimeError(f"ElevenLabs stream {r.status_code}: {body}")
+        async for chunk in r.aiter_bytes():
+            if chunk:
+                yield chunk
+
+
+def pcm_to_wav(
+    pcm: bytes, sample_rate: int = 16000, channels: int = 1, sampwidth: int = 2
+) -> bytes:
+    """Wrap raw PCM bytes in a WAV container (for the session recording)."""
+    buf = io.BytesIO()
+    with wave.open(buf, "wb") as w:
+        w.setnchannels(channels)
+        w.setsampwidth(sampwidth)
+        w.setframerate(sample_rate)
+        w.writeframes(pcm)
+    return buf.getvalue()
+
+
+# ============================================================
+# TTS text formatting — slow, clear lists
+# ============================================================
+_BULLET_RE = re.compile(r"^\s*[-•*]\s+(.*)$")
+_LIST_LABEL_RE = re.compile(r"^(?P<label>[^:]{1,40}):\s*(?P<rest>.+)$")
+
+# ElevenLabs v4 audio tags, e.g. [warm], [warm, cheerful], [laughs].
+_EMOTION_TAG_RE = re.compile(r"\[\s*[A-Za-z]+(?:\s*,\s*[A-Za-z]+)*\s*\]")
+
+
+def strip_emotion_tags(text: str) -> str:
+    """Remove ElevenLabs emotion tags from text for display/logging.
+
+    The tags are kept for TTS (they control delivery) but must not appear
+    in the UI, transcripts, or stored memory.
+    """
+    if not text:
+        return text
+    cleaned = _EMOTION_TAG_RE.sub(" ", text)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned)
+    cleaned = re.sub(r"^[ \t]+", "", cleaned, flags=re.MULTILINE)
+    return cleaned.strip()
+
+
+def format_for_tts(text: str) -> str:
+    """Insert natural pauses into ingredient/utensil lists.
+
+    Bullet lists become ellipsis-separated items, and inline lists after a
+    short label (``Ingredients: a, b, c``) get their commas turned into
+    ellipses. Normal conversation is returned unchanged so it isn't slowed.
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+
+    # 1) Bullet / dash lists → "item… item… and item." while KEEPING any
+    #    surrounding lines (e.g. a leading [warm] tag or an intro sentence).
+    if any(_BULLET_RE.match(l) for l in lines):
+        out: list[str] = []
+        items: list[str] = []
+
+        def flush() -> None:
+            if items:
+                out.append("… ".join(items) + ".")
+                items.clear()
+
+        for l in lines:
+            m = _BULLET_RE.match(l)
+            if m:
+                item = m.group(1).strip().rstrip(",;.")
+                if item:
+                    items.append(item)
+            else:
+                flush()
+                if l.strip():
+                    out.append(l.strip())
+        flush()
+        return "\n".join(out)
+
+    # 2) "Label: a, b, c" inline lists with 3+ short comma items.
+    out: list[str] = []
+    for l in lines:
+        m = _LIST_LABEL_RE.match(l.strip())
+        if m and m.group("rest").count(",") >= 2 and len(m.group("rest")) < 400:
+            parts = [
+                p.strip().rstrip(",;.")
+                for p in re.split(r",\s*", m.group("rest"))
+                if p.strip()
+            ]
+            if len(parts) >= 3:
+                l = f"{m.group('label')}: " + "… ".join(parts) + "."
+        out.append(l)
+    return "\n".join(out)
 
 
 # ============================================================
@@ -115,11 +271,10 @@ async def transcribe_sarvam(
     headers = {"api-subscription-key": key}
     files = {"file": (filename, io.BytesIO(audio_bytes), content_type)}
     data = {"model": model, "language_code": lang}
-    async with httpx.AsyncClient(timeout=60) as client:
-        r = await client.post(url, headers=headers, files=files, data=data)
-        if r.status_code >= 400:
-            raise RuntimeError(f"Sarvam {r.status_code}: {r.text[:300]}")
-        body = r.json()
+    r = await _client().post(url, headers=headers, files=files, data=data)
+    if r.status_code >= 400:
+        raise RuntimeError(f"Sarvam {r.status_code}: {r.text[:300]}")
+    body = r.json()
     for k in ("transcript", "text", "transcription"):
         if body.get(k):
             return str(body[k])
@@ -267,6 +422,7 @@ def capabilities() -> dict:
         "elevenlabs": elevenlabs_configured(),
         "elevenlabs_model": os.getenv("ELEVEN_MODEL_ID", "eleven_v3_conversational"),
         "elevenlabs_voice": os.getenv("ELEVEN_VOICE_ID", ""),
+        # Sarvam STT (preferred when key is set)
         "sarvam": sarvam_configured(),
         "sarvam_model": os.getenv("SARVAM_MODEL", "saaras:v3"),
         # LiveKit (optional realtime path)
@@ -298,6 +454,11 @@ __all__ = [
     "DEFAULT_TTS_VOICE",
     "VOSK_MODEL_DIR",
     "synthesize_elevenlabs",
+    "stream_elevenlabs",
+    "pcm_to_wav",
+    "format_for_tts",
+    "strip_emotion_tags",
+    "aclose",
     "synthesize_edge_tts",
     "transcribe_sarvam",
     "transcribe_vosk",

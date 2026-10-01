@@ -1,0 +1,120 @@
+name: ruchi-livekit
+
+# Local, self-contained LiveKit + Egress + Redis + MinIO stack.
+#
+# Recordings are uploaded by Egress to the MinIO bucket `recordings`
+# and also live on disk at ./data/minio/recordings/.
+#
+# Start:  docker compose -f infra/docker-compose.yaml up -d
+# Logs:   docker compose -f infra/docker-compose.yaml logs -f egress
+# Stop:   docker compose -f infra/docker-compose.yaml down
+#
+# This is a DEV setup: hardcoded devkey/secret and no TLS.
+
+services:
+  postgres:
+    # Postgres + pgvector for Ruchi's persistent memory / recipe RAG.
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - ./data/postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [lk]
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - ./data/redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    networks: [lk]
+
+  minio:
+    # MinIO removed its Docker Hub images; official images now live on Quay.
+    image: quay.io/minio/minio:latest
+    restart: unless-stopped
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "127.0.0.1:9000:9000"   # S3 API
+      - "127.0.0.1:9001:9001"   # web console
+    volumes:
+      - ./data/minio:/data
+    networks: [lk]
+
+  # One-shot: waits for MinIO, creates the recordings bucket, makes it
+  # publicly downloadable so recordings can be played straight from the
+  # MinIO URL.
+  minio-init:
+    image: quay.io/minio/mc:latest
+    restart: "no"
+    depends_on:
+      - minio
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      S3_BUCKET: ${S3_BUCKET}
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 \"$$MINIO_ROOT_USER\" \"$$MINIO_ROOT_PASSWORD\"; do
+        echo 'waiting for minio...'; sleep 2;
+      done;
+      mc mb --ignore-existing local/\"$$S3_BUCKET\";
+      mc anonymous set download local/\"$$S3_BUCKET\" || true;
+      echo \"bucket $$S3_BUCKET ready\";
+      "
+    networks: [lk]
+
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: ["--config", "/etc/livekit.yaml"]
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "127.0.0.1:7880:7880"             # signaling / websocket / HTTP API
+      - "127.0.0.1:7881:7881"             # RTC over TCP fallback
+      - "50000-50100:50000-50100/udp"     # WebRTC media
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [lk]
+
+  egress:
+    image: livekit/egress:latest
+    restart: unless-stopped
+    environment:
+      EGRESS_CONFIG_FILE: /out/egress.yaml
+    volumes:
+      - ./egress.yaml:/out/egress.yaml:ro
+      - ./data/egress-backup:/home/egress/backup_storage
+    # Required since egress v1.7.6 (Chrome sandboxing).
+    cap_add:
+      - SYS_ADMIN
+    depends_on:
+      redis:
+        condition: service_healthy
+      livekit:
+        condition: service_started
+    networks: [lk]
+
+networks:
+  lk:
+    driver: bridge

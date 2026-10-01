@@ -73,6 +73,84 @@ INTAKE_TOOL_SCHEMAS: list[dict[str, Any]] = [
 # ----------------------------------------------------------------------
 COOKING_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
+        "name": "load_recipe",
+        "description": (
+            "Call as soon as the user names the dish they want to cook, so the "
+            "recipe is loaded from the catalog. Pass the dish name in English "
+            "(translate Telugu dish names first). If the name is ambiguous the "
+            "tool returns the candidate recipes so you can ask which one."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The dish name, e.g. 'Pulihora', 'Idli', 'Sambar'.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "set_servings",
+        "description": (
+            "Call once the user says how many people they are cooking for, so "
+            "every ingredient quantity is scaled to that number. Call it BEFORE "
+            "listing ingredients or giving steps."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "servings": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "Number of people being cooked for.",
+                },
+            },
+            "required": ["servings"],
+        },
+    },
+    {
+        "name": "fetch_recipe_online",
+        "description": (
+            "Call when the dish is NOT in the local catalog — load_recipe "
+            "returned not-found, or its candidate list does not contain the "
+            "dish the user wants. Fetches the recipe from the web and loads it."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "The dish name to fetch from the web, in English.",
+                },
+            },
+            "required": ["name"],
+        },
+    },
+    {
+        "name": "suggest_recipes",
+        "description": (
+            "Call when the user asks what they can cook with certain "
+            "ingredients or for ideas — 'what can I make with paneer and rice?', "
+            "'suggest something for breakfast'. Returns matching recipes from "
+            "the catalog to offer the user."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "What the user wants, in English — e.g. 'paneer and rice', "
+                        "'quick breakfast', 'something with lentils'."
+                    ),
+                },
+            },
+            "required": ["description"],
+        },
+    },
+    {
         "name": "next_step",
         "description": (
             "Call when the user indicates they're ready to move forward — "
@@ -109,12 +187,34 @@ COOKING_TOOL_SCHEMAS: list[dict[str, Any]] = [
         },
     },
     {
+        "name": "mark_parallel_complete",
+        "description": (
+            "Call when the user confirms a 'meanwhile' parallel task is done "
+            "(e.g. the water is already boiling). Marks that future step as "
+            "completed so Ruchi never asks for it again. Pass the 1-indexed "
+            "step number of the parallel task that was just finished."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "step": {
+                    "type": "integer",
+                    "minimum": 1,
+                    "description": "The 1-indexed step number that was completed early.",
+                },
+            },
+            "required": ["step"],
+        },
+    },
+    {
         "name": "start_timer",
         "description": (
-            "Call ONLY when the user explicitly asks to start/set a timer — "
-            "not just when they mention a duration in passing ('this takes "
-            "about 20 minutes' is NOT a request to start a timer; 'set a "
-            "timer for 20 minutes' IS)."
+            "Call for EVERY cooking step that has a time, so Ruchi can wait "
+            "exactly that long before moving on. Examples: 'soak the rice for "
+            "30 minutes', 'cook onions for 5 mins', 'simmer for 10 minutes'. "
+            "Also call it when the user explicitly asks to set a timer. Do not "
+            "call it for a duration that isn't tied to a cooking step. Never "
+            "just say you set a timer — actually call this tool."
         ),
         "parameters": {
             "type": "object",
@@ -204,9 +304,9 @@ COOKING_TOOL_SCHEMAS: list[dict[str, Any]] = [
     {
         "name": "finish_cooking",
         "description": (
-            "Call when the user indicates they're done cooking or has "
-            "confirmed the last step is complete and doesn't want to "
-            "continue. Ends the session."
+            "Call when the cooking is complete — after the last step is "
+            "done and the user confirms they're finished — to end the "
+            "session. Do NOT call it mid-recipe."
         ),
         "parameters": {"type": "object", "properties": {}},
     },

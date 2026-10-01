@@ -28,9 +28,12 @@ never guesses intent itself.")
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any
 
-from .state import IssueState, TimerState, VoiceSession
+from .state import IssueState, RecipeContext, TimerState, VoiceSession
+
+logger = logging.getLogger("ruchi.cooking_tools")
 
 
 # Issue categories — the fixed set the app exposes as quick-tap chips
@@ -65,7 +68,7 @@ PREVIOUS_STEP_LEAD_IN = "Sure, here's the step before."
 # Canned timer phrases (TIMER.md).
 TIMER_SET_PHRASE = "Timer set for {duration}."
 TIMER_CANCELLED_PHRASE = "Timer cancelled."
-TIMER_EXPIRY_PHRASE = "Time's up — check your {label}."
+TIMER_EXPIRY_PHRASE = "Time's up — check whether your {label} is ready."
 NO_TIMER_RUNNING_PHRASE = "There's no timer running right now."
 
 
@@ -100,29 +103,58 @@ def _require_recipe(session: VoiceSession) -> None:
 
 
 def next_step(session: VoiceSession) -> dict[str, Any]:
-    """Advance to the next step.
+    """Advance to the next *not-yet-completed* step.
 
-    Handler behavior (STEP_NAVIGATION.md):
-    1. Increment stepIndex.
-    2. Publish ``step_changed``.
-    3. Return the canned lead-in + step text so the runner can speak
-       it without an extra LLM round-trip.
+    Steps completed early as a parallel "meanwhile" task are skipped so
+    Ruchi never asks the user to repeat them.
     """
     _require_recipe(session)
-    assert session.recipe is not None
-    if session.recipe.step_index >= len(session.recipe.steps) - 1:
+    recipe = session.recipe
+    assert recipe is not None
+    # The step the user was just on is now done.
+    recipe.mark_completed(recipe.step_index)
+    recipe.parallel_step_index = None
+    recipe.parallel_announced = False
+
+    nxt = recipe.next_open_index(recipe.step_index + 1)
+    if nxt is None:
         return {
             "type": "no_op",
             "reason": "already_at_last_step",
             "phrase": PAST_LAST_STEP_PHRASE,
         }
-    event = session.goto_step(session.recipe.step_index + 1)
+    event = session.goto_step(nxt)
     session.events.append(event)
     return {
         **event,
         "lead_in": NEXT_STEP_LEAD_IN,
         "phrase": f"{NEXT_STEP_LEAD_IN} {event['stepText']}",
     }
+
+
+def mark_parallel_complete(session: VoiceSession, step: int) -> dict[str, Any]:
+    """Mark a future step as already done (completed in parallel).
+
+    The model calls this when the user confirms a "meanwhile" task is
+    finished, so the step is skipped later instead of repeated.
+    """
+    _require_recipe(session)
+    recipe = session.recipe
+    assert recipe is not None
+    if not isinstance(step, int) or step < 1 or step > len(recipe.steps):
+        raise ValueError(f"step must be in 1..{len(recipe.steps)}, got {step!r}")
+    idx = step - 1
+    recipe.mark_completed(idx)
+    if recipe.parallel_step_index == idx:
+        recipe.parallel_step_index = None
+    event = {
+        "type": "step_completed",
+        "stepIndex": idx,
+        "stepText": recipe.steps[idx],
+        "parallel": True,
+    }
+    session.events.append(event)
+    return event
 
 
 def previous_step(session: VoiceSession) -> dict[str, Any]:
@@ -173,6 +205,146 @@ def goto_step(session: VoiceSession, step: int) -> dict[str, Any]:
 
 
 # ============================================================
+# Recipe catalog
+# ============================================================
+def load_recipe(session: VoiceSession, name: str) -> dict[str, Any]:
+    """Load a recipe from the bundled catalog by spoken dish name.
+
+    The model passes the dish name (it translates Telugu → English first).
+    Returns the loaded recipe, or the candidate list when the name is
+    ambiguous, or a not-found marker so Ruchi can ask for another dish.
+    """
+    from . import recipe_catalog  # local import keeps startup light
+
+    query = (name or "").strip()
+    if not query:
+        raise ValueError("name is required")
+    res = recipe_catalog.resolve(query)
+    status = res["status"]
+    if status == "none":
+        # Not in the bundled dataset — try to fetch it from the web.
+        try:
+            from . import online_recipe
+
+            online = online_recipe.fetch_recipe(query)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("online recipe fetch failed: %s", exc)
+            online = None
+        if online:
+            session.recipe = RecipeContext.from_metadata(online)
+            event = {
+                "type": "recipe_loaded",
+                "id": None,
+                "recipeName": session.recipe.recipe_name,
+                "steps": list(session.recipe.steps),
+                "stepIndex": 0,
+                "source": "online",
+            }
+            session.events.append(event)
+            return event
+        return {
+            "type": "recipe_not_found",
+            "query": query,
+            "phrase": f"I couldn't find {query} in my recipes.",
+        }
+    if status == "ambiguous":
+        candidates = res["candidates"]
+        return {
+            "type": "recipe_ambiguous",
+            "query": query,
+            "candidates": [{"id": e.id, "name": e.name} for e in candidates],
+            "phrase": "Which one did you mean: "
+            + ", ".join(e.name for e in candidates)
+            + "?",
+        }
+    entry = res["entry"]
+    session.recipe = RecipeContext.from_metadata(entry.recipe)
+    session.recipe.recipe_id = entry.id
+    event = {
+        "type": "recipe_loaded",
+        "id": entry.id,
+        "recipeName": entry.name,
+        "steps": list(session.recipe.steps),
+        "stepIndex": 0,
+    }
+    session.events.append(event)
+    return event
+
+
+def fetch_recipe_online(session: VoiceSession, name: str) -> dict[str, Any]:
+    """Fetch a recipe from the web and load it into the session."""
+    from . import online_recipe  # local import keeps startup light
+
+    query = (name or "").strip()
+    if not query:
+        raise ValueError("name is required")
+    recipe = online_recipe.fetch_recipe(query)
+    if not recipe:
+        return {
+            "type": "recipe_not_found",
+            "query": query,
+            "phrase": f"I couldn't find {query} online either.",
+        }
+    session.recipe = RecipeContext.from_metadata(recipe)
+    event = {
+        "type": "recipe_loaded",
+        "id": None,
+        "recipeName": session.recipe.recipe_name,
+        "steps": list(session.recipe.steps),
+        "stepIndex": 0,
+        "source": "online",
+    }
+    session.events.append(event)
+    return event
+
+
+def set_servings(session: VoiceSession, servings: int) -> dict[str, Any]:
+    """Scale every ingredient quantity to ``servings`` people."""
+    _require_recipe(session)
+    recipe = session.recipe
+    assert recipe is not None
+    if not isinstance(servings, int) or servings <= 0:
+        raise ValueError(f"servings must be a positive int, got {servings!r}")
+    if recipe.structured is not None:
+        recipe.structured.scale_to(servings)
+    ingredients = (
+        [i.spoken() for i in recipe.structured.ingredients]
+        if recipe.structured is not None
+        else []
+    )
+    event = {
+        "type": "servings_set",
+        "servings": servings,
+        "ingredients": ingredients,
+    }
+    session.events.append(event)
+    return event
+
+
+def suggest_recipes(session: VoiceSession, description: str) -> dict[str, Any]:
+    """Suggest recipes semantically, e.g. 'something with paneer and rice'."""
+    from .memory import recipe_index  # local import keeps startup light
+
+    query = (description or "").strip()
+    if not query:
+        raise ValueError("description is required")
+    matches = recipe_index.suggest(query, top_k=5)
+    if not matches:
+        return {
+            "type": "no_recipe_suggestions",
+            "query": query,
+            "phrase": f"I couldn't find recipes for {query}.",
+        }
+    event = {
+        "type": "recipe_suggestions",
+        "query": query,
+        "candidates": matches,
+    }
+    session.events.append(event)
+    return event
+
+
+# ============================================================
 # Timers
 # ============================================================
 def _format_duration(seconds: int) -> str:
@@ -213,6 +385,7 @@ def start_timer(session: VoiceSession, seconds: int, label: str) -> dict[str, An
     async def _run_timer() -> None:
         try:
             await asyncio.sleep(seconds)
+            session.active_timer = None  # clear so a new timer can start
             session.events.append(
                 {"type": "timer_expired", "label": label}
             )
@@ -429,6 +602,12 @@ __all__ = [
     "next_step",
     "previous_step",
     "goto_step",
+    "mark_parallel_complete",
+    # recipe catalog
+    "load_recipe",
+    "fetch_recipe_online",
+    "set_servings",
+    "suggest_recipes",
     # timers
     "start_timer",
     "cancel_timer",

@@ -26,12 +26,15 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
 from . import transcript
+from . import recording
+from . import server_voice
 from .dispatcher import known_tool_names
 from .mock_runner import run_mock_turn
 from .runner import GeminiFunctionCallingRunner, RunnerConfig, SessionManager, Turn
@@ -41,6 +44,78 @@ from .prompts_loader import load_instructions
 
 logger = logging.getLogger("ruchi.voice_agent_functions.routes")
 
+# Durations Ruchi might state in a step: English + Telugu units.
+_DURATION_RE = re.compile(
+    r"(\d+)\s*(నిమిషాలు|నిమిషం|నిమిషాల|గంటలు|గంట|సెకన్లు|సెకన్ల|సెకను"
+    r"|minutes?|mins?|hours?|hrs?|seconds?|secs?)",
+    re.IGNORECASE,
+)
+
+
+def _duration_seconds(text: str) -> int | None:
+    """Parse the first duration in ``text`` to seconds, or ``None``."""
+    m = _DURATION_RE.search(text or "")
+    if not m:
+        return None
+    n = int(m.group(1))
+    unit = m.group(2).lower()
+    if any(u in unit for u in ("గంట", "hour", "hr")):
+        return n * 3600
+    if any(u in unit for u in ("సెక", "sec")):
+        return n
+    return n * 60
+
+
+# Signals that a reply is an actual cooking instruction (not just a
+# question or a mention of time). Telugu imperatives almost always end
+# in "ండి"; English uses common cooking verbs.
+_STEP_HINT_RE = re.compile(
+    r"(ండి|వేయించ|ఉడికించ|నానబెట్ట|కలప|మగ్గించ|తరిగ|పోసి|మూత|"
+    r"\b(cook|boil|fry|simmer|soak|stir|heat|roast|saute|sauté|add|mix|"
+    r"pressure cook|bring to a boil|lower the flame)\b)",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_step(text: str) -> bool:
+    return bool(_STEP_HINT_RE.search(text or ""))
+
+
+def _ensure_step_timer(session, turn: "Turn") -> None:
+    """Guarantee a timer when Ruchi's reply states a duration.
+
+    The model doesn't reliably call ``start_timer`` even when it says the
+    time out loud, so if its reply is an actual cooking step that mentions
+    a duration, no timer is running, and it didn't already call the tool,
+    start one server-side.
+    """
+    if session.mode != "cook" or session.active_timer is not None:
+        return
+    if any(tc.get("name") == "start_timer" for tc in turn.tool_calls):
+        return
+    text = turn.assistant_text
+    # Only auto-time real step instructions, never questions or a
+    # passing mention of the total cooking time.
+    if "?" in text or "？" in text:
+        return
+    if not _looks_like_step(text):
+        return
+    secs = _duration_seconds(text)
+    if not secs:
+        return
+    label = "step timer"
+    if session.recipe and session.recipe.step_text():
+        label = session.recipe.step_text()[:40]
+    from .dispatcher import dispatch  # local import to avoid cycles
+
+    res = dispatch(session, "start_timer", {"seconds": secs, "label": label})
+    if "error" not in res:
+        turn.tool_calls.append(
+            {"name": "start_timer", "args": {"seconds": secs, "label": label}}
+        )
+        turn.tool_results.append(res.get("result"))
+        logger.info("auto-started step timer for %ss (%s)", secs, label)
+
 
 router = APIRouter(prefix="/api/voice-agent", tags=["voice-agent-functions"])
 
@@ -49,15 +124,30 @@ _runner: GeminiFunctionCallingRunner | None = None
 
 
 def _get_runner() -> GeminiFunctionCallingRunner:
-    """Lazy-build the singleton Gemini runner. If the API key is
-    missing we still create the runner — it just won't be used (mock
-    runner takes over)."""
+    """Lazy-build the singleton Gemini runner (mock runner if no key)."""
     global _runner
     if _runner is None:
         _runner = GeminiFunctionCallingRunner(
-            RunnerConfig(api_key=os.getenv("GOOGLE_API_KEY", ""))
+            RunnerConfig(
+                api_key=os.getenv("GOOGLE_API_KEY", ""),
+                max_output_tokens=int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "512")),
+                request_timeout=float(os.getenv("GEMINI_REQUEST_TIMEOUT", "4")),
+                attempts_per_model=int(os.getenv("GEMINI_ATTEMPTS", "4")),
+                hedge=int(os.getenv("GEMINI_HEDGE", "1")),
+                total_timeout=float(os.getenv("GEMINI_TOTAL_TIMEOUT", "12")),
+                turn_timeout=float(os.getenv("GEMINI_TURN_TIMEOUT", "16")),
+                thinking_budget=int(os.getenv("GEMINI_THINKING_BUDGET", "128")),
+            )
         )
     return _runner
+
+
+def lookup_session(session_id: str):
+    """Return a live session (memory or DB) or ``None``."""
+    try:
+        return _sessions.get(session_id)
+    except KeyError:
+        return None
 
 
 # ----------------------------------------------------------------------
@@ -67,6 +157,8 @@ class CreateSessionRequest(BaseModel):
     mode: Literal["intake", "cook"]
     session_id: str | None = None
     recipe: dict[str, Any] | None = None
+    # Per-browser identity for long-term memory (defaults to DEFAULT_USER_ID).
+    user_id: str | None = None
 
 
 class SessionStateResponse(BaseModel):
@@ -142,18 +234,18 @@ async def call_tool(session_id: str, req: CallToolRequest):
 async def create_session(req: CreateSessionRequest):
     if req.mode not in ("intake", "cook"):
         raise HTTPException(status_code=400, detail=f"unknown mode: {req.mode!r}")
-    if req.mode == "cook" and not req.recipe:
+    # Cook mode may start with no recipe: Ruchi loads it from the catalog
+    # by voice (load_recipe) once the user names a dish.
+    if req.mode == "cook" and req.recipe and not req.recipe.get("steps"):
         raise HTTPException(
             status_code=400,
-            detail=(
-                "cook mode requires a recipe context "
-                "{recipeName, steps[], stepIndex} — pass it as 'recipe'."
-            ),
+            detail="recipe.steps[] is required when a recipe is provided.",
         )
     session = _sessions.create(
         mode=req.mode,
         session_id=req.session_id,
         recipe=req.recipe,
+        user_id=req.user_id or os.getenv("DEFAULT_USER_ID", "default"),
     )
     return _session_to_response(session)
 
@@ -169,6 +261,8 @@ async def get_session(session_id: str):
 
 @router.delete("/sessions/{session_id}")
 async def delete_session(session_id: str):
+    # Build the session MP3 before forgetting the session.
+    recording.finalize(session_id)
     _sessions.drop(session_id)
     return {"ok": True}
 
@@ -224,6 +318,8 @@ async def run_turn(session_id: str, req: TurnRequest):
             events=list(session.events),
             provider="mock",
         )
+        _finalize_if_finished(session_id, mt.tool_calls)
+        _persist_turn(session, mt.user_text, mt.assistant_text, mt.tool_calls)
         return TurnResponse(
             session_id=session_id,
             user_text=mt.user_text,
@@ -236,6 +332,13 @@ async def run_turn(session_id: str, req: TurnRequest):
 
     runner = _get_runner()
     turn: Turn = await runner.run_turn(session, req.text)
+    # Never leave the user in silence: if the model failed/timed out and
+    # produced no speech, fall back to a short line so Ruchi still replies.
+    if turn.error and not turn.assistant_text:
+        turn.assistant_text = (
+            "క్షమించండి, ఇప్పుడు కొంచెం ఆలస్యం అవుతోంది. మళ్ళీ చెప్పండి."
+        )
+    _ensure_step_timer(session, turn)
     transcript.log_turn(
         session_id=session_id,
         mode=session.mode,
@@ -245,6 +348,8 @@ async def run_turn(session_id: str, req: TurnRequest):
         events=list(session.events),
         provider=os.getenv("GEMINI_MODEL", "gemini"),
     )
+    _finalize_if_finished(session_id, turn.tool_calls)
+    _persist_turn(session, turn.user_text, turn.assistant_text, turn.tool_calls)
     return TurnResponse(
         session_id=session_id,
         user_text=turn.user_text,
@@ -255,6 +360,49 @@ async def run_turn(session_id: str, req: TurnRequest):
         mock=False,
         error=turn.error,
     )
+
+
+# ----------------------------------------------------------------------
+# Memory (long-term, per user_id)
+# ----------------------------------------------------------------------
+class MemoryAddRequest(BaseModel):
+    memory: str
+    memory_type: str = "general"
+    importance: float = 0.5
+
+
+@router.get("/memory/{user_id}")
+async def list_memory(user_id: str):
+    from .memory import manager as memory_manager
+
+    return {
+        "enabled": memory_manager.memory_enabled(),
+        "memories": [m.to_dict() for m in memory_manager.list_memories(user_id)],
+    }
+
+
+@router.get("/memory/{user_id}/search")
+async def search_memory(user_id: str, q: str):
+    from .memory import manager as memory_manager
+
+    return {"memories": [m.to_dict() for m in memory_manager.search_memories(user_id, q)]}
+
+
+@router.post("/memory/{user_id}")
+async def add_memory(user_id: str, req: MemoryAddRequest):
+    from .memory import manager as memory_manager
+
+    ok = memory_manager.upsert_memory(
+        user_id, req.memory, req.memory_type, req.importance
+    )
+    return {"ok": ok}
+
+
+@router.delete("/memory/{user_id}")
+async def delete_memory(user_id: str):
+    from .memory import manager as memory_manager
+
+    return {"deleted": memory_manager.delete_memories(user_id)}
 
 
 @router.post("/sessions/{session_id}/save_answer")
@@ -302,6 +450,38 @@ async def list_prompts():
 
 
 # ----------------------------------------------------------------------
+# Session audio recording (mic + Ruchi TTS -> one MP3)
+# ----------------------------------------------------------------------
+@router.get("/sessions/{session_id}/recording")
+async def get_session_recording(session_id: str):
+    """Build (if needed) and return the session's MP3 recording.
+
+    404 until at least one audio segment (mic or TTS) has been captured
+    for the session. Safe to call repeatedly — the MP3 is only rebuilt
+    when new segments have arrived.
+    """
+    from fastapi.responses import FileResponse
+
+    path = recording.finalize(session_id)
+    if path is None or not path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="no recording for this session yet",
+        )
+    return FileResponse(path, media_type="audio/mpeg", filename=path.name)
+
+
+@router.get("/recordings")
+async def list_recordings():
+    """List every finalized MP3 in the recordings directory."""
+    return {
+        "dir": str(recording.recordings_dir()),
+        "enabled": recording.enabled(),
+        "recordings": recording.list_recordings(),
+    }
+
+
+# ----------------------------------------------------------------------
 # Transcript — the full user ↔ Ruchi conversation in text form
 # ----------------------------------------------------------------------
 @router.get("/transcript")
@@ -333,6 +513,31 @@ async def delete_transcript():
 # ----------------------------------------------------------------------
 # Helpers
 # ----------------------------------------------------------------------
+def _finalize_if_finished(session_id: str, tool_calls: list[dict[str, Any]]) -> None:
+    """Build the session MP3 as soon as a 'finish' tool fires, so a
+    complete recording exists without waiting for the download button."""
+    if any(tc.get("name") in ("finish_cooking", "finish_interview") for tc in tool_calls):
+        recording.finalize(session_id)
+
+
+def _persist_turn(session, user_text: str, assistant_text: str, tool_calls) -> None:
+    """Persist the turn to Postgres + schedule background memory extraction."""
+    try:
+        from .memory import context as memory_context
+
+        memory_context.record_turn(
+            user_id=session.user_id,
+            session_id=session.session_id,
+            user_text=user_text,
+            assistant_text=assistant_text or "",
+            tool_calls=tool_calls or [],
+            state=session.snapshot(),
+            recipe_id=session.recipe.recipe_id if session.recipe else None,
+        )
+    except Exception as exc:  # noqa: BLE001 - persistence never breaks the turn
+        logger.debug("turn persistence skipped: %s", exc)
+
+
 def _session_to_response(session) -> SessionStateResponse:
     timer = None
     if session.active_timer is not None:

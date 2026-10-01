@@ -18,3 +18,16 @@ models/
 # Audio artifacts
 *.pcm
 eleven_test.pcm
+
+# Local LiveKit infra runtime data + secrets
+infra/.env
+infra/data/
+
+# Session recordings (mic + Ruchi TTS MP3s)
+recordings/
+
+# Local embedding model cache (fastembed)
+data/fastembed/
+
+# One-off HuggingFace download cache (unused by code)
+data/hf_cache/
